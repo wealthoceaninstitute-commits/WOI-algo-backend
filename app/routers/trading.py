@@ -61,10 +61,11 @@ def _proxy(profile: ClientProfile) -> dict:
         return {}
     try:
         return {
-            "proxy_host": p.host,
-            "proxy_port": p.port,
-            "proxy_user": p.username,
-            "proxy_pass": decrypt(p.password) if p.password else None,
+            "proxy_scheme": p.scheme or "https",    # ← add
+            "proxy_host":   p.host,
+            "proxy_port":   p.port,
+            "proxy_user":   p.username,
+            "proxy_pass":   decrypt(p.password) if p.password else None,
         }
     except Exception:
         return {}
