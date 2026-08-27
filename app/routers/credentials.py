@@ -110,11 +110,12 @@ async def test_connection(
     pin         = decrypt(cred.pin)
     totp_secret = decrypt(cred.totp_secret)
 
-    proxy = profile.proxy_setting
+      proxy = profile.proxy_setting
     result = await test_dhan_connection(
         dhan_client_id=client_id,
         pin=pin,
         totp_secret=totp_secret,
+        proxy_scheme=proxy.scheme if proxy and proxy.is_active else "https",
         proxy_host=proxy.host if proxy and proxy.is_active else None,
         proxy_port=proxy.port if proxy and proxy.is_active else 443,
         proxy_user=proxy.username if proxy and proxy.is_active else None,
