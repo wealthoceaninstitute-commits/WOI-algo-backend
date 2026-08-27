@@ -1,7 +1,13 @@
 """
 Trading router — fetches live data from Dhan API.
-Auto-refreshes token on DH-906 (expired token) using stored TOTP secret.
-Falls back to local DB if all Dhan calls fail.
+
+Token strategy:
+  1. Check expiry FIRST — if token is valid, use it immediately (no Dhan call)
+  2. If expired or missing — refresh once via TOTP (with lock)
+  3. If DH-906 returned mid-session — refresh and retry once
+  4. 8 AM IST scheduled refresh keeps tokens always fresh before market open
+
+This eliminates redundant refreshes and parallel refresh storms.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,7 +17,7 @@ from typing import Optional
 
 from app.core.database import get_db
 from app.core.security import get_current_user, require_master
-from app.core.encryption import encrypt, decrypt
+from app.core.encryption import decrypt
 from app.models.user import User
 from app.models.trading import ClientProfile, Order, Position, DailyPnl, Fund
 from app.services.dhan_trade import (
@@ -19,12 +25,14 @@ from app.services.dhan_trade import (
     get_fund_limit, get_trades_by_order, get_order_by_id,
     normalize_order, normalize_position, normalize_trade,
 )
-from app.services.dhan import generate_access_token
+from app.services.token_manager import (
+    token_is_valid, get_stored_token, refresh_token,
+)
 
 router = APIRouter(prefix="/api", tags=["trading"])
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _profile(user: User, db: Session) -> ClientProfile:
     p = db.query(ClientProfile).filter(ClientProfile.user_id == user.id).first()
@@ -34,21 +42,17 @@ def _profile(user: User, db: Session) -> ClientProfile:
 
 
 def _creds(profile: ClientProfile):
-    """
-    Decrypt all four credential fields.
-    Returns (token, client_id, pin, totp) — any can be None if not set.
-    """
+    """Decrypt all four credential fields. Returns (client_id, pin, totp) or all None."""
     cred = profile.dhan_cred
     if not cred:
-        return None, None, None, None
+        return None, None, None
     try:
-        token     = decrypt(cred.access_token) or None
         client_id = decrypt(cred.dhan_client_id) or None
         pin       = decrypt(cred.pin) or None
         totp      = decrypt(cred.totp_secret) or None
-        return token, client_id, pin, totp
+        return client_id, pin, totp
     except Exception:
-        return None, None, None, None
+        return None, None, None
 
 
 def _proxy(profile: ClientProfile) -> dict:
@@ -66,69 +70,64 @@ def _proxy(profile: ClientProfile) -> dict:
         return {}
 
 
-async def _refresh_token(
+async def _get_valid_token(
     profile: ClientProfile,
-    client_id: str,
-    pin: str,
-    totp: str,
     db: Session,
-    **proxy_kw,
 ) -> Optional[str]:
     """
-    Generate a fresh token via TOTP and persist it to DB.
-    Returns the new token string, or None if generation failed.
-    """
-    print(f"[token_refresh] Generating fresh token for profile {profile.id}")
-    result = await generate_access_token(client_id, pin, totp, **proxy_kw)
-    if not result["success"]:
-        print(f"[token_refresh] Failed: {result['message']}")
-        return None
+    Return a valid Dhan access token.
 
-    new_token = result["access_token"]
-    cred = profile.dhan_cred
-    if cred:
-        cred.access_token  = encrypt(new_token)
-        cred.is_active     = True
-        cred.last_error    = None
-        cred.last_verified = datetime.now(timezone.utc)
-        db.commit()
-        print(f"[token_refresh] Token refreshed and stored")
-    return new_token
+    Strategy:
+      - Token not expired → return stored token immediately (no Dhan call)
+      - Token expired / missing → refresh via TOTP (with lock)
+      - No credentials → return None
+    """
+    client_id, pin, totp = _creds(profile)
+    if not client_id or not pin or not totp:
+        return None  # No credentials configured
+
+    proxy_kw = _proxy(profile)
+
+    # Token still valid — use it directly
+    if token_is_valid(profile):
+        return get_stored_token(profile)
+
+    # Token expired or missing — refresh
+    return await refresh_token(
+        profile, client_id, pin, totp, db,
+        reason="expired", **proxy_kw
+    )
 
 
 async def _dhan(fn, profile: ClientProfile, db: Session, *args):
     """
-    Call any Dhan API function with automatic token refresh on DH-906.
-
-    Flow:
-      1. Use stored token (or generate one if missing)
-      2. If Dhan returns DH-906 (expired) → refresh via TOTP → retry once
-      3. Return final result dict
-
-    All Dhan functions must return { success, token_expired, data/message }.
+    Call a Dhan API function with smart token handling:
+      1. Get valid token (from DB if not expired, refresh if expired)
+      2. Call Dhan
+      3. If DH-906 mid-call (shouldn't happen but can) → refresh + retry once
     """
-    token, client_id, pin, totp = _creds(profile)
-    proxy_kw = _proxy(profile)
-
-    # No credentials at all
+    client_id, pin, totp = _creds(profile)
     if not client_id or not pin or not totp:
         return {"success": False, "data": None,
                 "message": "No Dhan credentials configured"}
 
-    # No stored token → generate one before first call
-    if not token:
-        token = await _refresh_token(profile, client_id, pin, totp, db, **proxy_kw)
-        if not token:
-            return {"success": False, "data": None,
-                    "message": "Could not generate Dhan token"}
+    proxy_kw = _proxy(profile)
+    token = await _get_valid_token(profile, db)
 
-    # First attempt
+    if not token:
+        return {"success": False, "data": None,
+                "message": "Could not obtain valid Dhan token"}
+
+    # Call Dhan API
     result = await fn(token, *args, **proxy_kw)
 
-    # Auto-refresh on token expiry, then retry once
+    # DH-906 mid-session (token invalidated server-side) — refresh once and retry
     if result.get("token_expired"):
-        print(f"[dhan] Token expired — auto-refreshing")
-        new_token = await _refresh_token(profile, client_id, pin, totp, db, **proxy_kw)
+        print(f"[trading] DH-906 mid-session for profile {profile.id} — refreshing")
+        new_token = await refresh_token(
+            profile, client_id, pin, totp, db,
+            reason="dh906", **proxy_kw
+        )
         if new_token:
             result = await fn(new_token, *args, **proxy_kw)
         else:
@@ -139,7 +138,6 @@ async def _dhan(fn, profile: ClientProfile, db: Session, *args):
 
 
 def _to_list(raw) -> list:
-    """Ensure Dhan response data is always a list."""
     if raw is None:
         return []
     if isinstance(raw, list):
@@ -156,7 +154,7 @@ def _filter_status(items: list, status: Optional[str]) -> list:
     return [o for o in items if (o.get("status") or "").upper() == target]
 
 
-# ── DB serializers (fallback) ─────────────────────────────────────────────────
+# ── DB serializers (fallback when Dhan is unreachable) ────────────────────────
 
 def _ser_order(o: Order, client_name: str = None) -> dict:
     return {
@@ -218,7 +216,6 @@ async def list_orders(
         orders = [normalize_order(o) for o in _to_list(result.get("data"))]
         return {"source": "dhan", "data": _filter_status(orders, status)}
 
-    # Fallback to DB
     print(f"[orders] DB fallback: {result.get('message')}")
     q = db.query(Order).filter(Order.client_profile_id == profile.id)
     if status and status.upper() != "ALL":
@@ -297,7 +294,6 @@ async def list_positions(
         positions = [normalize_position(p) for p in _to_list(result.get("data"))]
         return {"source": "dhan", "data": _filter_status(positions, status)}
 
-    # Fallback to DB
     q = db.query(Position).filter(Position.client_profile_id == profile.id)
     if status and status.upper() != "ALL":
         q = q.filter(Position.status == status.upper())
@@ -343,7 +339,6 @@ async def fund_limit(
     result  = await _dhan(get_fund_limit, profile, db)
 
     if result["success"]:
-        # Sync to local DB for portfolio display
         fund = profile.fund
         if fund:
             fund.available     = result["available_balance"]
@@ -359,7 +354,6 @@ async def fund_limit(
             "collateral_amount":    result["collateral_amount"],
         }
 
-    # Fallback to DB
     fund = profile.fund
     if not fund:
         return {"source": "db", "available_balance": 0, "utilized_amount": 0,
