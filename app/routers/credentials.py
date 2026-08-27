@@ -19,6 +19,8 @@ from app.services.dhan import test_dhan_connection
 router = APIRouter(prefix="/api/credentials", tags=["credentials"])
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
 def _get_profile(user: User, db: Session) -> ClientProfile:
     p = db.query(ClientProfile).filter(ClientProfile.user_id == user.id).first()
     if not p:
@@ -33,7 +35,20 @@ def _get_profile_by_id(profile_id: str, db: Session) -> ClientProfile:
     return p
 
 
-# ── Save credentials (3 fields only) ─────────────────────────────────
+def _proxy_kwargs(proxy: ProxySetting) -> dict:
+    """Build proxy kwargs from a ProxySetting row."""
+    if not proxy or not proxy.is_active:
+        return {}
+    return {
+        "proxy_scheme": proxy.scheme or "https",
+        "proxy_host":   proxy.host,
+        "proxy_port":   proxy.port,
+        "proxy_user":   proxy.username,
+        "proxy_pass":   decrypt(proxy.password) if proxy.password else None,
+    }
+
+
+# ── Dhan credentials ──────────────────────────────────────────────────────────
 
 @router.put("/dhan", response_model=DhanCredentialResponse)
 def save_dhan_credentials(
@@ -41,6 +56,7 @@ def save_dhan_credentials(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Save Client ID, PIN and TOTP Secret — encrypted at rest."""
     profile = _get_profile(current_user, db)
     cred = profile.dhan_cred
 
@@ -94,13 +110,14 @@ def get_dhan_credentials(
     )
 
 
-# ── Test connection (auto-generates token via TOTP) ───────────────────
+# ── Connection test ───────────────────────────────────────────────────────────
 
 @router.post("/dhan/test", response_model=ConnectionTestResponse)
 async def test_connection(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """Generate fresh token via TOTP and verify with Fund Limit API."""
     profile = _get_profile(current_user, db)
     cred = profile.dhan_cred
     if not cred:
@@ -110,16 +127,11 @@ async def test_connection(
     pin         = decrypt(cred.pin)
     totp_secret = decrypt(cred.totp_secret)
 
-      proxy = profile.proxy_setting
     result = await test_dhan_connection(
         dhan_client_id=client_id,
         pin=pin,
         totp_secret=totp_secret,
-        proxy_scheme=proxy.scheme if proxy and proxy.is_active else "https",
-        proxy_host=proxy.host if proxy and proxy.is_active else None,
-        proxy_port=proxy.port if proxy and proxy.is_active else 443,
-        proxy_user=proxy.username if proxy and proxy.is_active else None,
-        proxy_pass=decrypt(proxy.password) if proxy and proxy.is_active and proxy.password else None,
+        **_proxy_kwargs(profile.proxy_setting),
     )
 
     now = datetime.now(timezone.utc)
@@ -127,7 +139,10 @@ async def test_connection(
     cred.last_verified = now
     cred.last_error    = None if result["success"] else result["message"]
     if result["success"] and result.get("access_token"):
-        cred.access_token = encrypt(result["access_token"])
+        cred.access_token    = encrypt(result["access_token"])
+        cred.token_expires_at = now.replace(hour=now.hour) # will be set by token_manager on refresh
+        from datetime import timedelta
+        cred.token_expires_at = now + timedelta(hours=24)
     db.commit()
 
     return ConnectionTestResponse(
@@ -139,13 +154,13 @@ async def test_connection(
     )
 
 
-# Master: test any client
 @router.post("/dhan/test/{client_profile_id}", response_model=ConnectionTestResponse)
 async def master_test_connection(
     client_profile_id: str,
     db: Session = Depends(get_db),
     _: User = Depends(require_master),
 ):
+    """Master: test connection for any client."""
     profile = _get_profile_by_id(client_profile_id, db)
     cred = profile.dhan_cred
     if not cred:
@@ -154,16 +169,12 @@ async def master_test_connection(
     client_id   = decrypt(cred.dhan_client_id)
     pin         = decrypt(cred.pin)
     totp_secret = decrypt(cred.totp_secret)
-    proxy       = profile.proxy_setting
 
     result = await test_dhan_connection(
         dhan_client_id=client_id,
         pin=pin,
         totp_secret=totp_secret,
-        proxy_host=proxy.host if proxy and proxy.is_active else None,
-        proxy_port=proxy.port if proxy and proxy.is_active else 443,
-        proxy_user=proxy.username if proxy and proxy.is_active else None,
-        proxy_pass=decrypt(proxy.password) if proxy and proxy.is_active and proxy.password else None,
+        **_proxy_kwargs(profile.proxy_setting),
     )
 
     now = datetime.now(timezone.utc)
@@ -171,7 +182,9 @@ async def master_test_connection(
     cred.last_verified = now
     cred.last_error    = None if result["success"] else result["message"]
     if result["success"] and result.get("access_token"):
-        cred.access_token = encrypt(result["access_token"])
+        from datetime import timedelta
+        cred.access_token     = encrypt(result["access_token"])
+        cred.token_expires_at = now + timedelta(hours=24)
     db.commit()
 
     return ConnectionTestResponse(
@@ -183,7 +196,7 @@ async def master_test_connection(
     )
 
 
-# ── Proxy ─────────────────────────────────────────────────────────────
+# ── Proxy ─────────────────────────────────────────────────────────────────────
 
 @router.put("/proxy", response_model=ProxyResponse)
 def save_proxy(
@@ -200,7 +213,7 @@ def save_proxy(
     enc_pass = encrypt(payload.password) if payload.password else None
     proxy = profile.proxy_setting
 
-       if proxy:
+    if proxy:
         proxy.scheme        = payload.scheme
         proxy.host          = payload.host
         proxy.port          = payload.port
@@ -224,8 +237,12 @@ def save_proxy(
     db.commit()
     db.refresh(proxy)
     return ProxyResponse(
-        id=proxy.id, host=proxy.host, port=proxy.port,
-        username=proxy.username, is_active=proxy.is_active,
+        id=proxy.id,
+        scheme=proxy.scheme or "https",
+        host=proxy.host,
+        port=proxy.port,
+        username=proxy.username,
+        is_active=proxy.is_active,
         set_by_master=proxy.set_by_master,
     )
 
@@ -239,9 +256,13 @@ def get_proxy(
     if not profile.proxy_setting:
         raise HTTPException(status_code=404, detail="No proxy configured")
     p = profile.proxy_setting
-        return ProxyResponse(
-        id=p.id, scheme=p.scheme or "https", host=p.host, port=p.port,
-        username=p.username, is_active=p.is_active,
+    return ProxyResponse(
+        id=p.id,
+        scheme=p.scheme or "https",
+        host=p.host,
+        port=p.port,
+        username=p.username,
+        is_active=p.is_active,
         set_by_master=p.set_by_master,
     )
 
