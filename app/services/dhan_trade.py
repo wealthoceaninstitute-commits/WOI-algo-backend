@@ -21,6 +21,7 @@ def _client(
     proxy_port: int = 443,
     proxy_user: Optional[str] = None,
     proxy_pass: Optional[str] = None,
+    proxy_scheme: str = "https",      # ← add this
 ) -> httpx.AsyncClient:
     headers = {
         "access-token": access_token,
@@ -30,7 +31,7 @@ def _client(
     proxy = None
     if proxy_host:
         auth = f"{proxy_user}:{proxy_pass}@" if proxy_user and proxy_pass else ""
-        proxy = f"http://{auth}{proxy_host}:{proxy_port}"
+        proxy = f"{proxy_scheme}://{auth}{proxy_host}:{proxy_port}"
     return httpx.AsyncClient(
         headers=headers,
         proxies={"http://": proxy, "https://": proxy} if proxy else None,
