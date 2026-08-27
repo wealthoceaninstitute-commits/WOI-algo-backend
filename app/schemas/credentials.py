@@ -35,7 +35,7 @@ class ProxyRequest(BaseModel):
     port: int = 443
     username: Optional[str] = None
     password: Optional[str] = None
-    client_profile_id: Optional[str] = None
+    client_profile_id: Optional[str] = None   # master use only
 
 
 class ProxyResponse(BaseModel):
