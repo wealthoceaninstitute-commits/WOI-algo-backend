@@ -2,17 +2,10 @@
 app/services/token_manager.py
 
 Dhan token lifecycle management:
-
   1. Token stored in DB with expiry timestamp (24h from generation)
-  2. On every API call — check expiry FIRST, call Dhan only if valid
-  3. On DH-906 — refresh once, with an asyncio.Lock to prevent parallel refresh storms
-  4. Scheduled refresh at 8:00 AM IST every day for all active clients
-     (so tokens are always fresh before market opens at 9:15 AM)
-
-This eliminates:
-  - Redundant mid-session refreshes
-  - Parallel "Token can be generated once every 2 minutes" errors
-  - Latency on every request from unnecessary refresh attempts
+  2. On every API call — check expiry FIRST, no Dhan call if token valid
+  3. On DH-906 — refresh once with asyncio.Lock (no parallel refresh storms)
+  4. Scheduled 8:00 AM IST refresh for all clients (fresh before 9:15 AM market open)
 """
 
 import asyncio
@@ -23,11 +16,8 @@ from sqlalchemy.orm import Session
 from app.core.encryption import encrypt, decrypt
 from app.services.dhan import generate_access_token
 
-# ── IST timezone ──────────────────────────────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# ── Per-profile refresh lock — prevents parallel refresh storms ───────────────
-# Key: profile_id → asyncio.Lock
 _refresh_locks: dict[str, asyncio.Lock] = {}
 
 def _get_lock(profile_id: str) -> asyncio.Lock:
@@ -36,32 +26,22 @@ def _get_lock(profile_id: str) -> asyncio.Lock:
     return _refresh_locks[profile_id]
 
 
-# ── Token expiry check ────────────────────────────────────────────────────────
-
 def token_is_valid(profile) -> bool:
-    """
-    Return True if the stored token is present AND not expired.
-    Dhan tokens last 24h — we use a 30-min safety buffer.
-    """
+    """Return True if stored token is present and not expired (30-min buffer)."""
     cred = profile.dhan_cred
     if not cred or not cred.is_active:
         return False
-
-    # No expiry recorded → assume expired (will refresh once)
     if not cred.token_expires_at:
         return False
-
     now = datetime.now(timezone.utc)
     expires = cred.token_expires_at
     if expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
-
-    # 30-minute buffer before actual expiry
     return now < (expires - timedelta(minutes=30))
 
 
 def get_stored_token(profile) -> Optional[str]:
-    """Return decrypted stored token, or None if not available."""
+    """Return decrypted stored token, or None."""
     cred = profile.dhan_cred
     if not cred:
         return None
@@ -72,7 +52,22 @@ def get_stored_token(profile) -> Optional[str]:
         return None
 
 
-# ── Token refresh with lock ───────────────────────────────────────────────────
+def _get_proxy_kwargs(profile) -> dict:
+    """Extract proxy kwargs from profile.proxy_setting."""
+    p = profile.proxy_setting
+    if not p or not p.is_active:
+        return {}
+    try:
+        return {
+            "proxy_scheme": p.scheme or "https",
+            "proxy_host":   p.host,
+            "proxy_port":   p.port,
+            "proxy_user":   p.username,
+            "proxy_pass":   decrypt(p.password) if p.password else None,
+        }
+    except Exception:
+        return {}
+
 
 async def refresh_token(
     profile,
@@ -84,22 +79,18 @@ async def refresh_token(
     **proxy_kw,
 ) -> Optional[str]:
     """
-    Generate a fresh Dhan token via TOTP and store it in DB.
-    Uses per-profile lock so only ONE refresh happens even with parallel requests.
-
-    Returns new token string, or None if generation failed.
+    Generate fresh Dhan token via TOTP and store in DB.
+    Lock prevents parallel refresh storms.
     """
     lock = _get_lock(profile.id)
 
-    # If another coroutine already holds the lock, wait for it then
-    # check if the token was already refreshed — avoid double refresh
     async with lock:
-        # Re-check after acquiring lock — another request may have already refreshed
+        # Re-check after lock — another request may have already refreshed
         db.refresh(profile)
         if token_is_valid(profile) and reason != "forced":
             stored = get_stored_token(profile)
             if stored:
-                print(f"[token_manager] Token already refreshed by parallel request — reusing")
+                print("[token_manager] Token already refreshed by parallel request — reusing")
                 return stored
 
         print(f"[token_manager] Refreshing token for profile {profile.id} (reason: {reason})")
@@ -112,11 +103,10 @@ async def refresh_token(
         new_token = result["access_token"]
         cred = profile.dhan_cred
         if cred:
-            cred.access_token    = encrypt(new_token)
-            cred.is_active       = True
-            cred.last_error      = None
-            cred.last_verified   = datetime.now(timezone.utc)
-            # Store expiry = now + 24h (Dhan tokens are valid 24h)
+            cred.access_token     = encrypt(new_token)
+            cred.is_active        = True
+            cred.last_error       = None
+            cred.last_verified    = datetime.now(timezone.utc)
             cred.token_expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
             db.commit()
             print(f"[token_manager] Token stored, expires at {cred.token_expires_at.strftime('%Y-%m-%d %H:%M UTC')}")
@@ -124,23 +114,16 @@ async def refresh_token(
         return new_token
 
 
-# ── 8 AM IST scheduled refresh ────────────────────────────────────────────────
-
 async def scheduled_morning_refresh(db_factory):
     """
-    Run in background. Every day at 8:00 AM IST refresh tokens for ALL
-    clients that have valid credentials — so market opens with fresh tokens.
-
-    Call this from main.py lifespan with:
-        asyncio.create_task(scheduled_morning_refresh(SessionLocal))
+    Background task — refreshes all client tokens at 8:00 AM IST every day.
+    Staggered 5s between clients to avoid Dhan rate limits.
     """
     from app.models.trading import ClientProfile, DhanCredential
-    from app.core.encryption import decrypt
 
     while True:
         now_ist = datetime.now(IST)
-        # Calculate seconds until next 8:00 AM IST
-        target = now_ist.replace(hour=8, minute=0, second=0, microsecond=0)
+        target  = now_ist.replace(hour=8, minute=0, second=0, microsecond=0)
         if now_ist >= target:
             target += timedelta(days=1)
         wait_secs = (target - now_ist).total_seconds()
@@ -150,7 +133,7 @@ async def scheduled_morning_refresh(db_factory):
 
         await asyncio.sleep(wait_secs)
 
-        print(f"[token_manager] === 8 AM scheduled token refresh starting ===")
+        print("[token_manager] === 8 AM scheduled token refresh starting ===")
         db: Session = db_factory()
         try:
             profiles = (
@@ -171,10 +154,11 @@ async def scheduled_morning_refresh(db_factory):
                     if not client_id or not pin or not totp:
                         continue
 
-                    # Stagger by 5 seconds between clients to avoid Dhan rate limits
-                    await asyncio.sleep(5)
+                    proxy_kw = _get_proxy_kwargs(profile)
 
-                    result = await generate_access_token(client_id, pin, totp)
+                    await asyncio.sleep(5)  # stagger between clients
+
+                    result = await generate_access_token(client_id, pin, totp, **proxy_kw)
                     if result["success"]:
                         cred.access_token     = encrypt(result["access_token"])
                         cred.is_active        = True
@@ -182,16 +166,16 @@ async def scheduled_morning_refresh(db_factory):
                         cred.last_verified    = datetime.now(timezone.utc)
                         cred.token_expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
                         db.commit()
-                        print(f"[token_manager] ✓ Refreshed: profile {profile.id}")
+                        print(f"[token_manager] Refreshed: profile {profile.id}")
                     else:
-                        print(f"[token_manager] ✗ Failed: profile {profile.id}: {result['message']}")
+                        print(f"[token_manager] Failed: profile {profile.id}: {result['message']}")
 
                 except Exception as e:
-                    print(f"[token_manager] Error refreshing profile {profile.id}: {e}")
+                    print(f"[token_manager] Error: profile {profile.id}: {e}")
 
         except Exception as e:
             print(f"[token_manager] Scheduled refresh error: {e}")
         finally:
             db.close()
 
-        print(f"[token_manager] === Scheduled refresh complete ===")
+        print("[token_manager] === Scheduled refresh complete ===")
