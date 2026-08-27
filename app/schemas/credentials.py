@@ -7,7 +7,6 @@ class DhanCredentialRequest(BaseModel):
     dhan_client_id: str
     pin: str
     totp_secret: str
-    # No access_token — auto-generated via TOTP on each connect
 
 
 class DhanCredentialResponse(BaseModel):
@@ -31,6 +30,7 @@ class ConnectionTestResponse(BaseModel):
 
 
 class ProxyRequest(BaseModel):
+    scheme: str = "https"          # http | https
     host: str
     port: int = 443
     username: Optional[str] = None
@@ -40,6 +40,7 @@ class ProxyRequest(BaseModel):
 
 class ProxyResponse(BaseModel):
     id: str
+    scheme: str
     host: str
     port: int
     username: Optional[str]
