@@ -199,7 +199,8 @@ def save_proxy(
     enc_pass = encrypt(payload.password) if payload.password else None
     proxy = profile.proxy_setting
 
-    if proxy:
+       if proxy:
+        proxy.scheme        = payload.scheme
         proxy.host          = payload.host
         proxy.port          = payload.port
         proxy.username      = payload.username
@@ -209,6 +210,7 @@ def save_proxy(
     else:
         proxy = ProxySetting(
             client_profile_id=profile.id,
+            scheme=payload.scheme,
             host=payload.host,
             port=payload.port,
             username=payload.username,
@@ -236,8 +238,8 @@ def get_proxy(
     if not profile.proxy_setting:
         raise HTTPException(status_code=404, detail="No proxy configured")
     p = profile.proxy_setting
-    return ProxyResponse(
-        id=p.id, host=p.host, port=p.port,
+        return ProxyResponse(
+        id=p.id, scheme=p.scheme or "https", host=p.host, port=p.port,
         username=p.username, is_active=p.is_active,
         set_by_master=p.set_by_master,
     )
