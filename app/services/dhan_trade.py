@@ -241,33 +241,9 @@ async def cancel_order(access_token: str, order_id: str, **proxy) -> dict:
         return {"success": False, "message": f"Dhan {r.status_code}: {r.text[:300]}"}
 
 
-# ── Helper: normalize order from Dhan → our format ───────────────────────────
 
-def normalize_order(o: dict) -> dict:
-    """Convert Dhan order response fields to our internal format."""
-    return {
-        "dhan_order_id":     o.get("orderId"),
-        "symbol":            o.get("tradingSymbol", ""),
-        "security_id":       o.get("securityId"),
-        "exchange_segment":  o.get("exchangeSegment"),
-        "order_type":        o.get("transactionType"),        # BUY/SELL
-        "quantity":          o.get("quantity", 0),
-        "price":             o.get("price", 0.0),
-        "trigger_price":     o.get("triggerPrice", 0.0),
-        "executed_price":    o.get("averageTradedPrice", 0.0),
-        "filled_qty":        o.get("filledQty", 0),
-        "remaining_qty":     o.get("remainingQuantity", 0),
-        "status":            _map_status(o.get("orderStatus", "")),
-        "rejection_reason":  o.get("omsErrorDescription"),
-        "expiry":            o.get("drvExpiryDate"),
-        "option_type":       o.get("drvOptionType"),        # CALL/PUT
-        "strike_price":      o.get("drvStrikePrice", 0.0),
-        "placed_at":         o.get("createTime"),
-        "updated_at":        o.get("updateTime"),
-        "product_type":      o.get("productType"),
-        "order_sub_type":    o.get("orderType"),            # MARKET/LIMIT etc
-        "correlation_id":    o.get("correlationId"),
-    }
+
+
 
 
 def normalize_position(p: dict) -> dict:
@@ -324,14 +300,41 @@ def normalize_trade(t: dict) -> dict:
 
 
 def _map_status(dhan_status: str) -> str:
-    """Map Dhan order statuses to our DB enum."""
+    """Map Dhan order statuses → our internal status."""
     m = {
-        "TRANSIT":     "PENDING",
-        "PENDING":     "PENDING",
-        "PART_TRADED": "PENDING",
-        "TRADED":      "EXECUTED",
-        "REJECTED":    "REJECTED",
-        "CANCELLED":   "CANCELLED",
-        "EXPIRED":     "CANCELLED",
+        "TRANSIT":      "PENDING",
+        "PENDING":      "PENDING",
+        "PART_TRADED":  "PENDING",
+        "TRADED":       "EXECUTED",
+        "REJECTED":     "REJECTED",
+        "CANCELLED":    "CANCELLED",
+        "EXPIRED":      "CANCELLED",
     }
-    return m.get(dhan_status.upper(), "PENDING")
+    return m.get((dhan_status or "").upper(), "PENDING")
+
+
+def normalize_order(o: dict) -> dict:
+    """Convert Dhan order response fields to our internal format."""
+    return {
+        "dhan_order_id":    o.get("orderId"),
+        "symbol":           o.get("tradingSymbol", ""),
+        "security_id":      o.get("securityId"),
+        "exchange_segment": o.get("exchangeSegment"),
+        "order_type":       o.get("transactionType", ""),   # BUY / SELL
+        "quantity":         o.get("quantity", 0),
+        "price":            o.get("price", 0.0),
+        "trigger_price":    o.get("triggerPrice", 0.0),
+        "executed_price":   o.get("averageTradedPrice", 0.0),
+        "filled_qty":       o.get("filledQty", 0),
+        "remaining_qty":    o.get("remainingQuantity", 0),
+        "status":           _map_status(o.get("orderStatus", "")),
+        "rejection_reason": o.get("omsErrorDescription"),
+        "expiry":           o.get("drvExpiryDate"),
+        "option_type":      o.get("drvOptionType"),         # CALL / PUT
+        "strike_price":     o.get("drvStrikePrice", 0.0),
+        "placed_at":        o.get("createTime"),
+        "updated_at":       o.get("updateTime"),
+        "product_type":     o.get("productType"),
+        "order_sub_type":   o.get("orderType"),             # MARKET / LIMIT
+        "correlation_id":   o.get("correlationId"),
+    }
