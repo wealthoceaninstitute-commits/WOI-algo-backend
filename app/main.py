@@ -1,20 +1,37 @@
+import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.core.config import get_settings
-from app.core.database import create_tables
+from app.core.database import create_tables, SessionLocal
 from app.core.bootstrap import create_master_if_needed
 from app.routers import auth, clients, credentials, trading
+from app.services.token_manager import scheduled_morning_refresh
 
 settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 1. Create DB tables
     create_tables()
+
+    # 2. Create master user if env vars are set
     create_master_if_needed()
+
+    # 3. Start 8 AM IST daily token refresh scheduler
+    task = asyncio.create_task(scheduled_morning_refresh(SessionLocal))
+    print("[startup] 8 AM token refresh scheduler started")
+
     yield
+
+    # Cleanup on shutdown
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(
