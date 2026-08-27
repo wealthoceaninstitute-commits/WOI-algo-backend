@@ -33,10 +33,16 @@ def _profile(user: User, db: Session) -> ClientProfile:
 def _dhan_creds(profile: ClientProfile):
     """Return (access_token, dhan_client_id) or (None, None)."""
     cred = profile.dhan_cred
-    if not cred or not cred.is_active:
+    if not cred:
         return None, None
+    # Allow fetch even if is_active=False — token may still be valid
     try:
-        return decrypt(cred.access_token), decrypt(cred.dhan_client_id)
+        token = decrypt(cred.access_token)
+        client_id = decrypt(cred.dhan_client_id)
+        # Empty token means credentials saved but never tested
+        if not token or token.strip() == "":
+            return None, None
+        return token, client_id
     except Exception:
         return None, None
 
@@ -45,12 +51,15 @@ def _proxy_kwargs(profile: ClientProfile) -> dict:
     p = profile.proxy_setting
     if not p or not p.is_active:
         return {}
-    return {
-        "proxy_host": p.host,
-        "proxy_port": p.port,
-        "proxy_user": p.username,
-        "proxy_pass": decrypt(p.password) if p.password else None,
-    }
+    try:
+        return {
+            "proxy_host": p.host,
+            "proxy_port": p.port,
+            "proxy_user": p.username,
+            "proxy_pass": decrypt(p.password) if p.password else None,
+        }
+    except Exception:
+        return {}
 
 
 def _db_order(o: Order, client_name: str = None) -> dict:
@@ -98,66 +107,53 @@ def _db_position(p: Position, client_name: str = None) -> dict:
     }
 
 
+def _filter_by_status(orders: list, status: str) -> list:
+    """Filter normalized orders by status string."""
+    if not status or status.upper() == "ALL":
+        return orders
+    target = status.upper()
+    # Map frontend filter → possible Dhan statuses already normalized
+    return [o for o in orders if o.get("status", "").upper() == target]
+
+
 # ── Orders ────────────────────────────────────────────────────────────────────
 
 @router.get("/orders")
 async def list_orders(
     status: Optional[str] = Query(None),
-    source: Optional[str] = Query("dhan", description="dhan | db"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """
-    Fetch today's orders.
-    source=dhan  → live from Dhan API (default)
-    source=db    → from our local database
+    Fetch today's orders live from Dhan API.
+    Falls back to DB if token not set or Dhan call fails.
     """
     profile = _profile(user, db)
+    token, dhan_client_id = _dhan_creds(profile)
 
-    if source == "dhan":
-        token, _ = _dhan_creds(profile)
-        if token:
+    if token:
+        try:
             result = await get_order_book(token, **_proxy_kwargs(profile))
             if result["success"]:
-                orders = [normalize_order(o) for o in (result["data"] or [])]
-                # Filter by status if requested
-                if status and status.upper() != "ALL":
-                    mapped = {"PENDING": ["PENDING", "TRANSIT", "PART_TRADED"],
-                              "EXECUTED": ["TRADED"], "REJECTED": ["REJECTED"],
-                              "CANCELLED": ["CANCELLED", "EXPIRED"]}
-                    allow = mapped.get(status.upper(), [status.upper()])
-                    orders = [o for o in orders if o["status"].upper() in
-                              [_map_status_reverse(a) for a in allow]]
-                return {"source": "dhan", "data": orders}
+                raw = result.get("data") or []
+                # Dhan returns a list directly
+                if isinstance(raw, dict):
+                    raw = [raw]
+                orders = [normalize_order(o) for o in raw if isinstance(o, dict)]
+                orders = _filter_by_status(orders, status)
+                return {"source": "dhan", "data": orders, "count": len(orders)}
+            else:
+                # Log the error but fall through to DB
+                print(f"[orders] Dhan error: {result.get('message')}")
+        except Exception as e:
+            print(f"[orders] Exception calling Dhan: {e}")
 
     # Fallback to DB
     q = db.query(Order).filter(Order.client_profile_id == profile.id)
     if status and status.upper() != "ALL":
         q = q.filter(Order.status == status.upper())
     rows = q.order_by(Order.placed_at.desc()).limit(200).all()
-    return {"source": "db", "data": [_db_order(o) for o in rows]}
-
-
-def _map_status_reverse(s: str) -> str:
-    m = {"PENDING": "PENDING", "EXECUTED": "TRADED",
-         "REJECTED": "REJECTED", "CANCELLED": "CANCELLED"}
-    return m.get(s, s)
-
-
-@router.get("/orders/{order_id}")
-async def get_order(
-    order_id: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """Get a single order by Dhan order ID."""
-    profile = _profile(user, db)
-    token, _ = _dhan_creds(profile)
-    if token:
-        result = await get_order_by_id(token, order_id, **_proxy_kwargs(profile))
-        if result["success"]:
-            return {"source": "dhan", "data": normalize_order(result["data"])}
-    raise HTTPException(status_code=404, detail="Order not found or API not connected")
+    return {"source": "db", "data": [_db_order(o) for o in rows], "count": len(rows)}
 
 
 @router.get("/orders/all")
@@ -177,6 +173,24 @@ async def list_all_orders(
     return {"source": "db", "data": [_db_order(o, o.client_profile.user.name) for o in orders]}
 
 
+@router.get("/orders/{order_id}")
+async def get_order(
+    order_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    profile = _profile(user, db)
+    token, _ = _dhan_creds(profile)
+    if token:
+        try:
+            result = await get_order_by_id(token, order_id, **_proxy_kwargs(profile))
+            if result["success"]:
+                return {"source": "dhan", "data": normalize_order(result["data"])}
+        except Exception as e:
+            print(f"[get_order] Exception: {e}")
+    raise HTTPException(status_code=404, detail="Order not found or API not connected")
+
+
 # ── Trades ────────────────────────────────────────────────────────────────────
 
 @router.get("/trades")
@@ -184,20 +198,24 @@ async def list_trades(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """
-    Today's executed trades — live from Dhan trade book.
-    Only orders with TRADED status (actually filled).
-    """
     profile = _profile(user, db)
     token, _ = _dhan_creds(profile)
+
     if not token:
-        raise HTTPException(status_code=400, detail="Dhan API not connected. Save and test credentials first.")
+        # Return empty instead of raising — frontend handles gracefully
+        return {"source": "none", "data": [], "message": "Dhan API credentials not connected"}
 
-    result = await get_trade_book(token, **_proxy_kwargs(profile))
-    if not result["success"]:
-        raise HTTPException(status_code=502, detail=result["message"])
-
-    return {"source": "dhan", "data": [normalize_trade(t) for t in (result["data"] or [])]}
+    try:
+        result = await get_trade_book(token, **_proxy_kwargs(profile))
+        if result["success"]:
+            raw = result.get("data") or []
+            if isinstance(raw, dict):
+                raw = [raw]
+            return {"source": "dhan", "data": [normalize_trade(t) for t in raw if isinstance(t, dict)]}
+        return {"source": "dhan", "data": [], "message": result.get("message")}
+    except Exception as e:
+        print(f"[trades] Exception: {e}")
+        return {"source": "error", "data": [], "message": str(e)}
 
 
 @router.get("/trades/{order_id}")
@@ -206,20 +224,22 @@ async def get_trades_for_order(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Get all trades generated for a specific order (partial fills etc.)."""
     profile = _profile(user, db)
     token, _ = _dhan_creds(profile)
     if not token:
         raise HTTPException(status_code=400, detail="Dhan API not connected")
-
-    result = await get_trades_by_order(token, order_id, **_proxy_kwargs(profile))
-    if not result["success"]:
-        raise HTTPException(status_code=502, detail=result["message"])
-
-    data = result["data"]
-    if isinstance(data, dict):
-        data = [data]
-    return {"source": "dhan", "data": [normalize_trade(t) for t in data]}
+    try:
+        result = await get_trades_by_order(token, order_id, **_proxy_kwargs(profile))
+        if not result["success"]:
+            raise HTTPException(status_code=502, detail=result["message"])
+        data = result["data"]
+        if isinstance(data, dict):
+            data = [data]
+        return {"source": "dhan", "data": [normalize_trade(t) for t in data]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Positions ─────────────────────────────────────────────────────────────────
@@ -227,26 +247,26 @@ async def get_trades_for_order(
 @router.get("/positions")
 async def list_positions(
     status: Optional[str] = Query(None),
-    source: Optional[str] = Query("dhan"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """
-    Open/closed positions.
-    source=dhan → live from Dhan (default)
-    source=db   → from our local DB
-    """
     profile = _profile(user, db)
+    token, _ = _dhan_creds(profile)
 
-    if source == "dhan":
-        token, _ = _dhan_creds(profile)
-        if token:
+    if token:
+        try:
             result = await get_positions(token, **_proxy_kwargs(profile))
             if result["success"]:
-                positions = [normalize_position(p) for p in (result["data"] or [])]
+                raw = result.get("data") or []
+                if isinstance(raw, dict):
+                    raw = [raw]
+                positions = [normalize_position(p) for p in raw if isinstance(p, dict)]
                 if status and status.upper() != "ALL":
                     positions = [p for p in positions if p["status"] == status.upper()]
                 return {"source": "dhan", "data": positions}
+            print(f"[positions] Dhan error: {result.get('message')}")
+        except Exception as e:
+            print(f"[positions] Exception: {e}")
 
     # Fallback to DB
     q = db.query(Position).filter(Position.client_profile_id == profile.id)
@@ -261,7 +281,6 @@ async def list_all_positions(
     db: Session = Depends(get_db),
     _: User = Depends(require_master),
 ):
-    """Master: all positions from DB."""
     from sqlalchemy.orm import joinedload
     rows = (
         db.query(Position)
@@ -280,17 +299,17 @@ async def list_holdings(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Demat holdings — live from Dhan."""
     profile = _profile(user, db)
     token, _ = _dhan_creds(profile)
     if not token:
-        raise HTTPException(status_code=400, detail="Dhan API not connected")
-
-    result = await get_holdings(token, **_proxy_kwargs(profile))
-    if not result["success"]:
-        raise HTTPException(status_code=502, detail=result["message"])
-
-    return {"source": "dhan", "data": result["data"]}
+        return {"source": "none", "data": [], "message": "Dhan API not connected"}
+    try:
+        result = await get_holdings(token, **_proxy_kwargs(profile))
+        if result["success"]:
+            return {"source": "dhan", "data": result["data"]}
+        return {"source": "dhan", "data": [], "message": result.get("message")}
+    except Exception as e:
+        return {"source": "error", "data": [], "message": str(e)}
 
 
 # ── Fund Limit ────────────────────────────────────────────────────────────────
@@ -300,33 +319,30 @@ async def fund_limit(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """
-    Live fund limit from Dhan — available balance, utilized, withdrawable.
-    Also updates the local funds table for portfolio display.
-    """
     profile = _profile(user, db)
     token, _ = _dhan_creds(profile)
 
     if token:
-        result = await get_fund_limit(token, **_proxy_kwargs(profile))
-        if result["success"]:
-            # Sync to local DB
-            fund = profile.fund
-            if fund:
-                fund.available    = result["available_balance"]
-                fund.used_margin  = result["utilized_amount"]
-                fund.total_balance = result["available_balance"] + result["utilized_amount"]
-                db.commit()
-            return {
-                "source": "dhan",
-                "available_balance":    result["available_balance"],
-                "utilized_amount":      result["utilized_amount"],
-                "withdrawable_balance": result["withdrawable_balance"],
-                "sod_limit":            result["sod_limit"],
-                "collateral_amount":    result["collateral_amount"],
-            }
+        try:
+            result = await get_fund_limit(token, **_proxy_kwargs(profile))
+            if result["success"]:
+                fund = profile.fund
+                if fund:
+                    fund.available     = result["available_balance"]
+                    fund.used_margin   = result["utilized_amount"]
+                    fund.total_balance = result["available_balance"] + result["utilized_amount"]
+                    db.commit()
+                return {
+                    "source": "dhan",
+                    "available_balance":    result["available_balance"],
+                    "utilized_amount":      result["utilized_amount"],
+                    "withdrawable_balance": result["withdrawable_balance"],
+                    "sod_limit":            result["sod_limit"],
+                    "collateral_amount":    result["collateral_amount"],
+                }
+        except Exception as e:
+            print(f"[funds] Exception: {e}")
 
-    # Fallback to DB
     fund = profile.fund
     if not fund:
         return {"source": "db", "available_balance": 0, "utilized_amount": 0,
