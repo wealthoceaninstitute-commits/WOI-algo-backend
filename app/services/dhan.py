@@ -1,9 +1,6 @@
 """
 Dhan API service — auto-generates access token using Client ID + PIN + TOTP.
-No manual token entry needed. Token refreshed on every connect/test.
-
-Auth endpoint: POST https://auth.dhan.co/app/generateAccessToken
-               ?dhanClientId=...&pin=...&totp=...
+Supports scheme (http/https) in proxy URL — matches DHAN_PROXY_SCHEME env var.
 """
 import time
 import pyotp
@@ -19,18 +16,34 @@ API_BASE  = "https://api.dhan.co/v2"
 TIMEOUT   = 15.0
 
 
-def _proxy_url(host, port, user, pwd):
+def _proxy_url(
+    scheme: str,
+    host: str,
+    port: int,
+    user: Optional[str],
+    pwd: Optional[str],
+) -> str:
     auth = f"{user}:{pwd}@" if user and pwd else ""
-    return f"http://{auth}{host}:{port}"
+    return f"{scheme}://{auth}{host}:{port}"
 
 
-def _api_client(access_token, proxy_host=None, proxy_port=443, proxy_user=None, proxy_pass=None):
+def _api_client(
+    access_token: str,
+    proxy_scheme: str = "https",
+    proxy_host: Optional[str] = None,
+    proxy_port: int = 443,
+    proxy_user: Optional[str] = None,
+    proxy_pass: Optional[str] = None,
+) -> httpx.AsyncClient:
     headers = {
         "access-token": access_token,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    proxy = _proxy_url(proxy_host, proxy_port, proxy_user, proxy_pass) if proxy_host else None
+    proxy = (
+        _proxy_url(proxy_scheme, proxy_host, proxy_port, proxy_user, proxy_pass)
+        if proxy_host else None
+    )
     return httpx.AsyncClient(
         headers=headers,
         proxies={"http://": proxy, "https://": proxy} if proxy else None,
@@ -51,23 +64,26 @@ async def generate_access_token(
     dhan_client_id: str,
     pin: str,
     totp_secret: str,
-    proxy_host=None,
-    proxy_port=443,
-    proxy_user=None,
-    proxy_pass=None,
+    proxy_scheme: str = "https",
+    proxy_host: Optional[str] = None,
+    proxy_port: int = 443,
+    proxy_user: Optional[str] = None,
+    proxy_pass: Optional[str] = None,
 ) -> dict:
     """
     Generate a fresh Dhan access token using Client ID + PIN + TOTP.
     Retries once if TOTP window expires mid-request.
     """
     checked_at = datetime.now(timezone.utc)
-    proxy = _proxy_url(proxy_host, proxy_port, proxy_user, proxy_pass) if proxy_host else None
+    proxy = (
+        _proxy_url(proxy_scheme, proxy_host, proxy_port, proxy_user, proxy_pass)
+        if proxy_host else None
+    )
 
     for attempt in range(2):
         totp_code = _generate_totp(totp_secret)
         secs_left = _seconds_until_next_window()
 
-        # Wait if in last 2 seconds of TOTP window
         if secs_left <= 2 and attempt == 0:
             time.sleep(secs_left + 1)
             totp_code = _generate_totp(totp_secret)
@@ -132,12 +148,14 @@ async def test_dhan_connection(
     dhan_client_id: str,
     pin: str,
     totp_secret: str,
-    proxy_host=None,
-    proxy_port=443,
-    proxy_user=None,
-    proxy_pass=None,
+    proxy_scheme: str = "https",
+    proxy_host: Optional[str] = None,
+    proxy_port: int = 443,
+    proxy_user: Optional[str] = None,
+    proxy_pass: Optional[str] = None,
 ) -> dict:
     """
+    Full connection test:
     1. Generate fresh access token via TOTP
     2. Call Fund Limit API to verify token works
     """
@@ -145,7 +163,7 @@ async def test_dhan_connection(
 
     token_result = await generate_access_token(
         dhan_client_id, pin, totp_secret,
-        proxy_host, proxy_port, proxy_user, proxy_pass,
+        proxy_scheme, proxy_host, proxy_port, proxy_user, proxy_pass,
     )
 
     if not token_result["success"]:
@@ -158,7 +176,9 @@ async def test_dhan_connection(
     access_token = token_result["access_token"]
 
     try:
-        async with _api_client(access_token, proxy_host, proxy_port, proxy_user, proxy_pass) as client:
+        async with _api_client(
+            access_token, proxy_scheme, proxy_host, proxy_port, proxy_user, proxy_pass
+        ) as client:
             resp = await client.get(f"{API_BASE}/fundlimit")
 
             if resp.status_code == 200:
