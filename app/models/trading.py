@@ -55,16 +55,17 @@ class DhanCredential(Base):
 class ProxySetting(Base):
     __tablename__ = "proxy_settings"
 
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    id                = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     client_profile_id = Column(String, ForeignKey("client_profiles.id", ondelete="CASCADE"), unique=True, nullable=False)
-    host = Column(String, nullable=False)
-    port = Column(Integer, default=443)
-    username = Column(String, nullable=True)
-    password = Column(String, nullable=True)   # Encrypted if provided
-    is_active = Column(Boolean, default=True)
-    set_by_master = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    scheme            = Column(String, default="https")   # http | https
+    host              = Column(String, nullable=False)
+    port              = Column(Integer, default=443)
+    username          = Column(String, nullable=True)
+    password          = Column(String, nullable=True)
+    is_active         = Column(Boolean, default=True)
+    set_by_master     = Column(Boolean, default=False)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
 
     client_profile = relationship("ClientProfile", back_populates="proxy_setting")
 
