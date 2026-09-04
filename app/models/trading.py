@@ -145,3 +145,114 @@ class DailyPnl(Base):
     updated_at        = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
     client_profile = relationship("ClientProfile", back_populates="daily_pnl")
+
+
+class AlgoStrategy(Base):
+    """
+    WOI Strategy configuration — one row per client.
+    All editable parameters stored here. Master or client can update.
+    """
+    __tablename__ = "algo_strategies"
+
+    id                = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    client_profile_id = Column(String, ForeignKey("client_profiles.id", ondelete="CASCADE"), unique=True, nullable=False)
+    name              = Column(String, default="WOI")           # strategy name (editable label)
+    is_active         = Column(Boolean, default=False)           # master on/off switch
+    paper_trading     = Column(Boolean, default=True)            # paper vs live
+
+    # ── Universe / Scanner ─────────────────────────────────────
+    gap_min           = Column(Numeric(5, 2), default=3.0)       # min gap % for pre-open scan
+    gap_max           = Column(Numeric(5, 2), default=8.0)       # max gap % for pre-open scan
+    max_stocks_per_day= Column(Integer, default=5)               # max stocks to trade per day
+    live_scan_seconds = Column(Integer, default=60)              # post-open live scan window
+
+    # ── Risk ───────────────────────────────────────────────────
+    risk_per_trade    = Column(Numeric(10, 2), default=400.0)    # ₹ risk per trade
+
+    # ── Entry ──────────────────────────────────────────────────
+    entry_buffer_pct  = Column(Numeric(6, 4), default=0.004)     # 0.4% entry buffer from close
+    sl_pct            = Column(Numeric(6, 4), default=0.004)     # 0.4% SL from entry trigger
+    entry_reference   = Column(String, default="close")          # "close" or "highlow"
+    use_first_candle  = Column(Boolean, default=True)            # use first 1-min candle only
+    disable_shift     = Column(Boolean, default=True)            # no dynamic order shifting
+    boring_ratio      = Column(Numeric(5, 3), default=0.35)      # body/range ≤ this = boring candle
+
+    # ── Missed move guard ──────────────────────────────────────
+    entry_missed_cancel   = Column(Boolean, default=True)
+    entry_missed_cancel_r = Column(Numeric(5, 2), default=1.5)   # cancel if price runs 1.5R past trigger
+
+    # ── Target & Trail SL ──────────────────────────────────────
+    target_r          = Column(Numeric(5, 2), default=4.0)       # take profit at 4R
+    # Trail steps stored as JSON string: [[r_trigger, lock_r], ...]
+    trail_sl_steps    = Column(Text, default='[[2.5,0.0],[3.0,0.5],[3.7,2.0]]')
+
+    # ── TP on exchange ─────────────────────────────────────────
+    tp_on_exchange        = Column(Boolean, default=True)
+    tp_exchange_place_r   = Column(Numeric(5, 2), default=2.0)   # place TP once profit hits 2R
+    tp_exchange_cancel_r  = Column(Numeric(5, 2), default=1.0)   # pull TP if profit drops below 1R
+
+    # ── Re-entry ───────────────────────────────────────────────
+    reentry_mode          = Column(String, default="both_sides")  # "same_side" or "both_sides"
+    max_reentry_attempts  = Column(Integer, default=0)            # 0 = no re-entry
+
+    # ── Gap direction ──────────────────────────────────────────
+    gap_direction_bias    = Column(Boolean, default=False)        # False = OCO both sides
+    sl_basis              = Column(String, default="trigger")     # "trigger" or "fill"
+
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
+
+    client_profile = relationship("ClientProfile", backref="algo_strategy")
+
+
+class AlgoRun(Base):
+    """Tracks each time the algo runs — status, stocks picked, results."""
+    __tablename__ = "algo_runs"
+
+    id                = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    client_profile_id = Column(String, ForeignKey("client_profiles.id", ondelete="CASCADE"), nullable=False, index=True)
+    strategy_id       = Column(String, ForeignKey("algo_strategies.id", ondelete="SET NULL"), nullable=True)
+    run_date          = Column(Date, nullable=False, index=True)
+    status            = Column(String, default="idle")  # idle | scanning | running | done | error
+    stocks_scanned    = Column(Integer, default=0)
+    stocks_selected   = Column(Integer, default=0)
+    stocks_traded     = Column(Integer, default=0)
+    total_pnl         = Column(Numeric(12, 2), default=0)
+    log               = Column(Text, default="")        # append-only run log
+    started_at        = Column(DateTime(timezone=True), nullable=True)
+    finished_at       = Column(DateTime(timezone=True), nullable=True)
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+
+    client_profile = relationship("ClientProfile", backref="algo_runs")
+
+
+class AlgoStock(Base):
+    """Stocks selected by scanner for a given run — with entry/exit details."""
+    __tablename__ = "algo_stocks"
+
+    id                = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_id            = Column(String, ForeignKey("algo_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    client_profile_id = Column(String, ForeignKey("client_profiles.id", ondelete="CASCADE"), nullable=False)
+    symbol            = Column(String, nullable=False)
+    security_id       = Column(String, nullable=False)
+    gap_pct           = Column(Numeric(6, 2), nullable=True)
+    direction         = Column(String, nullable=True)       # UP | DOWN
+    prev_close        = Column(Numeric(10, 2), nullable=True)
+    candle_high       = Column(Numeric(10, 2), nullable=True)
+    candle_low        = Column(Numeric(10, 2), nullable=True)
+    candle_close      = Column(Numeric(10, 2), nullable=True)
+    buy_trigger       = Column(Numeric(10, 2), nullable=True)
+    sell_trigger      = Column(Numeric(10, 2), nullable=True)
+    entry_direction   = Column(String, nullable=True)       # BUY | SELL (which side triggered)
+    entry_price       = Column(Numeric(10, 2), nullable=True)
+    exit_price        = Column(Numeric(10, 2), nullable=True)
+    quantity          = Column(Integer, nullable=True)
+    pnl               = Column(Numeric(12, 2), nullable=True)
+    status            = Column(String, default="watching")  # watching | entered | exited | cancelled
+    buy_order_id      = Column(String, nullable=True)
+    sell_order_id     = Column(String, nullable=True)
+    source            = Column(String, default="preopen")   # preopen | live
+    created_at        = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
+
+    run = relationship("AlgoRun", backref="stocks")
