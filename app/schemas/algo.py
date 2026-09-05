@@ -56,12 +56,12 @@ class AlgoStrategyRequest(BaseModel):
     gap_direction_bias: bool = False
     sl_basis: str = "trigger"               # "trigger" | "fill"
 
-    # Stock universe & filters
+    # Stock universe & filters (0 = disabled for all numeric filters)
     universe_id:       Optional[str]   = None
-    min_price:         float           = Field(50.0,    ge=0,      le=100000)
-    max_price:         float           = Field(10000.0, ge=1,      le=1000000)
-    min_volume:        int             = Field(500000,  ge=0)
-    min_turnover_cr:   float           = Field(10.0,    ge=0)
+    min_price:         float           = Field(0.0,  ge=0)
+    max_price:         float           = Field(0.0,  ge=0)
+    min_volume:        int             = Field(0,    ge=0)
+    min_turnover_cr:   float           = Field(0.0,  ge=0)
     exclude_be_series: bool            = False
 
 
