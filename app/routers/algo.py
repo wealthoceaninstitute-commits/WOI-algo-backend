@@ -77,6 +77,13 @@ def _apply_strategy(s: AlgoStrategy, payload: AlgoStrategyRequest) -> AlgoStrate
     s.max_reentry_attempts  = payload.max_reentry_attempts
     s.gap_direction_bias    = payload.gap_direction_bias
     s.sl_basis              = payload.sl_basis
+    # Stock universe & filters
+    s.universe_id           = payload.universe_id
+    s.min_price             = payload.min_price
+    s.max_price             = payload.max_price
+    s.min_volume            = payload.min_volume
+    s.min_turnover_cr       = payload.min_turnover_cr
+    s.exclude_be_series     = payload.exclude_be_series
     return s
 
 
