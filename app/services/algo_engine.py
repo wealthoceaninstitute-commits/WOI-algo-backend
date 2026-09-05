@@ -1,28 +1,15 @@
 """
 app/services/algo_engine.py — WOI Paper Trade Engine
 
-Stock selection sequence:
-  1. Load universe from DB (strategy.universe_id → UniverseStock table)
-  2. Pre-open OHLC scan via master Dhan account
-  3. Apply filters:
-       - Gap %        : gap_min ≤ |gap%| ≤ gap_max
-       - Price        : min_price ≤ prev_close ≤ max_price
-       - Volume       : prev_day_volume ≥ min_volume
-       - Turnover     : prev_close × volume ≥ min_turnover_cr × 1cr
-       - BE exclusion : exclude_be_series = True → skip BE series
-  4. Sort by absolute gap % descending
-  5. Take top max_stocks_per_day
-
-Entry (9:15 AM):
-  - First 1-min candle → compute BUY/SELL triggers
-  - Paper trade: simulate fills from live LTP
-
-Monitor (every 5s):
-  - Trail SL per ladder
-  - Exit at target_r or SL
-
-EOD (3:20 PM):
-  - Force-exit all open paper positions
+Stock selection flow:
+  08:45 AM → Fetch LTP for entire universe → store as prev_close snapshot
+  09:12:30 → Fetch LTP again → this is the opening/pre-open price
+  09:12:30 → Compute gap% = (open_ltp - prev_close) / prev_close × 100
+  09:12:30 → Apply filters → sort by |gap%| → pick top N
+  09:15:00 → Wait for first 1-min candle (9:15–9:16)
+  09:15:30 → Fetch first candle → compute BUY/SELL triggers
+  09:16:00+ → Monitor loop every 5s → trail SL → exit at target
+  15:20:00 → Force exit all open paper positions
 """
 
 import asyncio, json
@@ -34,12 +21,11 @@ from app.core.database import SessionLocal
 from app.models.trading import ClientProfile, AlgoStrategy, AlgoRun, AlgoStock, DailyPnl
 from app.models.scrip_master import UniverseStock, ScripMaster
 from app.services.market_data import (
-    get_master_token, fetch_ohlc_batch, fetch_ltp, fetch_first_candle,
+    get_master_token, fetch_ltp, fetch_first_candle,
 )
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Fallback universe — used only if no universe_id set on strategy
 FALLBACK_UNIVERSE = [
     "1333","11536","10895","15083","4963","3456","14977","1232","5258","11630",
     "2475","16675","7229","1526","13611","10940","467","11184","6705","3787",
@@ -91,20 +77,17 @@ def _get_or_create_run(profile_id: str, strategy_id: str, db: Session) -> AlgoRu
 
 def _load_universe(strategy: AlgoStrategy, db: Session) -> list[dict]:
     """
-    Load stock universe from DB for this strategy.
+    Load active stocks from the strategy's assigned universe.
     Returns list of { security_id, symbol, series, lot_size }
-    Falls back to hardcoded list if no universe configured.
     """
     if not strategy.universe_id:
-        # No universe set — use fallback hardcoded list
-        print(f"[algo] No universe set for strategy {strategy.id} — using fallback list")
+        print(f"[algo] No universe set — using fallback list")
         rows = db.query(ScripMaster).filter(
             ScripMaster.security_id.in_(FALLBACK_UNIVERSE)
         ).all()
         return [{"security_id": r.security_id, "symbol": r.symbol,
                  "series": r.series, "lot_size": r.lot_size} for r in rows]
 
-    # Load from universe_stocks table
     stocks = (
         db.query(UniverseStock)
         .filter(
@@ -117,11 +100,10 @@ def _load_universe(strategy: AlgoStrategy, db: Session) -> list[dict]:
     )
 
     if not stocks:
-        print(f"[algo] Universe {strategy.universe_id} is empty — using fallback")
+        print(f"[algo] Universe empty — using fallback")
         return [{"security_id": sid, "symbol": sid, "series": "EQ", "lot_size": 1}
                 for sid in FALLBACK_UNIVERSE]
 
-    # Enrich with scrip_master data (series, lot_size)
     result = []
     for s in stocks:
         scrip = db.query(ScripMaster).filter(
@@ -130,143 +112,187 @@ def _load_universe(strategy: AlgoStrategy, db: Session) -> list[dict]:
         result.append({
             "security_id": s.security_id,
             "symbol":      s.symbol,
-            "series":      scrip.series if scrip else "EQ",
-            "lot_size":    scrip.lot_size if scrip else 1,
+            "series":      scrip.series    if scrip else "EQ",
+            "lot_size":    scrip.lot_size  if scrip else 1,
         })
 
-    print(f"[algo] Universe loaded: {len(result)} active stocks")
+    print(f"[algo] Universe loaded: {len(result)} stocks")
     return result
 
 
-# ── Pre-open gap scan ─────────────────────────────────────────────────────────
+# ── Wait until a specific IST time ───────────────────────────────────────────
 
-async def _preopen_scan(
-    token: str,
-    client_id: str,
-    universe: list[dict],
-) -> dict:
+async def _wait_until(hour: int, minute: int, second: int = 0, label: str = ""):
+    now_ist = datetime.now(IST)
+    target  = now_ist.replace(hour=hour, minute=minute, second=second, microsecond=0)
+    wait    = (target - now_ist).total_seconds()
+    if wait > 0:
+        print(f"[algo] Waiting {wait:.0f}s until {hour:02d}:{minute:02d}:{second:02d} IST {label}")
+        await asyncio.sleep(wait)
+
+
+# ── Step 1: 8:45 AM — prev close snapshot ────────────────────────────────────
+
+async def _fetch_prev_close_snapshot(
+    token: str, client_id: str, universe: list[dict]
+) -> dict[str, float]:
     """
-    Fetch OHLC for all universe stocks in batches of 100.
-    Returns { security_id: { symbol, gap_pct, prev_close, open, volume, series } }
-    Rate limit: 1 req/sec on Dhan marketfeed API.
+    Fetch LTP at 8:45 AM for all universe stocks.
+    This becomes the 'previous close' baseline for gap calculation.
+    Returns { security_id: ltp }
     """
     sec_ids = [u["security_id"] for u in universe]
+    print(f"[algo] 8:45 AM snapshot: fetching LTP for {len(sec_ids)} stocks...")
+
+    snapshot = {}
+    for i in range(0, len(sec_ids), 900):   # Dhan allows 1000 per request
+        batch  = sec_ids[i:i+900]
+        prices = await fetch_ltp(token, client_id, batch)
+        snapshot.update(prices)
+        if i + 900 < len(sec_ids):
+            await asyncio.sleep(1.1)         # 1 req/sec rate limit
+
+    valid = {k: v for k, v in snapshot.items() if v and v > 0}
+    print(f"[algo] 8:45 AM snapshot: {len(valid)} stocks with valid LTP")
+    return valid
+
+
+# ── Step 2: 9:12:30 — opening price scan + gap calculation ───────────────────
+
+async def _fetch_opening_prices(
+    token: str, client_id: str, universe: list[dict]
+) -> dict[str, float]:
+    """
+    Fetch LTP at 9:12:30 AM — this is the pre-open discovered price
+    (indicative opening price before actual market open at 9:15).
+    Returns { security_id: ltp }
+    """
+    sec_ids = [u["security_id"] for u in universe]
+    print(f"[algo] 9:12:30 scan: fetching opening LTP for {len(sec_ids)} stocks...")
+
+    opening = {}
+    for i in range(0, len(sec_ids), 900):
+        batch  = sec_ids[i:i+900]
+        prices = await fetch_ltp(token, client_id, batch)
+        opening.update(prices)
+        if i + 900 < len(sec_ids):
+            await asyncio.sleep(1.1)
+
+    valid = {k: v for k, v in opening.items() if v and v > 0}
+    print(f"[algo] 9:12:30 scan: {len(valid)} stocks with valid price")
+    return valid
+
+
+def _compute_gaps(
+    prev_close: dict[str, float],
+    opening:    dict[str, float],
+    universe:   list[dict],
+) -> dict[str, dict]:
+    """
+    gap% = (opening_ltp - prev_close_ltp) / prev_close_ltp × 100
+    Returns { security_id: { symbol, gap_pct, prev_close, open_price, series, lot_size } }
+    """
     meta    = {u["security_id"]: u for u in universe}
-
-    print(f"[algo] Pre-open scan: {len(sec_ids)} stocks in {(len(sec_ids)+99)//100} batches")
-    all_quotes = {}
-
-    for i in range(0, len(sec_ids), 100):
-        batch  = sec_ids[i:i+100]
-        quotes = await fetch_ohlc_batch(token, client_id, batch)
-        all_quotes.update(quotes)
-        await asyncio.sleep(1.1)   # 1 req/sec rate limit
-
     results = {}
-    for sid, q in all_quotes.items():
-        prev  = float(q.get("prev_close") or 0)
-        open_ = float(q.get("open")       or 0)
-        vol   = int(q.get("volume")       or 0)
-        if prev <= 0 or open_ <= 0:
+
+    for sid, open_price in opening.items():
+        prev = prev_close.get(sid)
+        if not prev or prev <= 0 or open_price <= 0:
             continue
-        gap_pct = ((open_ - prev) / prev) * 100
+        gap_pct = ((open_price - prev) / prev) * 100
         m       = meta.get(sid, {})
         results[sid] = {
-            "symbol":     m.get("symbol", q.get("symbol", sid)),
-            "series":     m.get("series", "EQ"),
-            "lot_size":   m.get("lot_size", 1),
-            "gap_pct":    round(gap_pct, 2),
-            "prev_close": prev,
-            "open":       open_,
-            "volume":     vol,
-            "turnover_cr": round((prev * vol) / 1e7, 2),  # ₹ crores
+            "symbol":      m.get("symbol", sid),
+            "series":      m.get("series", "EQ"),
+            "lot_size":    m.get("lot_size", 1),
+            "gap_pct":     round(gap_pct, 2),
+            "prev_close":  round(prev, 2),
+            "open_price":  round(open_price, 2),
         }
 
-    print(f"[algo] Got quotes for {len(results)} stocks")
     return results
 
 
-# ── Stock filter & selection ──────────────────────────────────────────────────
+# ── Step 3: Apply filters & select top N ─────────────────────────────────────
 
 def _apply_filters(
     gap_results: dict,
-    strategy: AlgoStrategy,
-    run: AlgoRun,
-    db: Session,
+    strategy:    AlgoStrategy,
+    run:         AlgoRun,
+    db:          Session,
 ) -> list[dict]:
     """
-    Apply all configured filters to gap results.
-    Returns filtered + sorted list, capped at max_stocks_per_day.
-
-    Sequence:
-      1. Gap % band filter
-      2. Price filter (min/max prev close)
-      3. Volume filter
-      4. Turnover filter
-      5. BE series exclusion
-      6. Sort by |gap%| descending
-      7. Take top N
+    Filter sequence:
+      1. Gap % band
+      2. Min price (prev_close ≥ min_price)
+      3. Max price (prev_close ≤ max_price, if set)
+      4. BE series exclusion
+      5. Sort by |gap%| descending
+      6. Take top max_stocks_per_day
+    Note: volume/turnover not available from LTP — skipped in this flow.
     """
-    gap_min    = float(strategy.gap_min)
-    gap_max    = float(strategy.gap_max)
-    # 0 = disabled for all filters except max_price (0 would block everything)
-    min_price  = float(strategy.min_price or 0)
-    max_price  = float(strategy.max_price or 0)   # 0 = no max limit
-    min_vol    = int(strategy.min_volume  or 0)   # 0 = no volume filter
-    min_turn   = float(strategy.min_turnover_cr or 0)  # 0 = no turnover filter
-    excl_be    = bool(strategy.exclude_be_series)
-    max_n      = int(strategy.max_stocks_per_day)
+    gap_min   = float(strategy.gap_min)
+    gap_max   = float(strategy.gap_max)
+    min_price = float(strategy.min_price or 0)
+    max_price = float(strategy.max_price or 0)
+    excl_be   = bool(strategy.exclude_be_series)
+    max_n     = int(strategy.max_stocks_per_day)
 
-    passed = []
-    rejected = {"gap": 0, "price": 0, "volume": 0, "turnover": 0, "be": 0}
+    passed   = []
+    rejected = {"gap": 0, "price": 0, "be": 0}
 
     for sid, d in gap_results.items():
         gap  = abs(d["gap_pct"])
         prev = d["prev_close"]
-        vol  = d["volume"]
-        turn = d["turnover_cr"]
         ser  = d.get("series", "EQ")
 
+        # 1. Gap band
         if not (gap_min <= gap <= gap_max):
-            rejected["gap"] += 1; continue
-        # Price filter — 0 = disabled
+            rejected["gap"] += 1
+            continue
+
+        # 2. Min price filter (0 = disabled)
         if min_price > 0 and prev < min_price:
-            rejected["price"] += 1; continue
+            rejected["price"] += 1
+            continue
+
+        # 3. Max price filter (0 = disabled)
         if max_price > 0 and prev > max_price:
-            rejected["price"] += 1; continue
-        # Volume filter — 0 = disabled
-        if min_vol > 0 and vol < min_vol:
-            rejected["volume"] += 1; continue
-        # Turnover filter — 0 = disabled
-        if min_turn > 0 and turn < min_turn:
-            rejected["turnover"] += 1; continue
+            rejected["price"] += 1
+            continue
+
+        # 4. BE series exclusion
         if excl_be and ser == "BE":
-            rejected["be"] += 1; continue
+            rejected["be"] += 1
+            continue
 
         passed.append({"security_id": sid, **d})
 
     _log(run,
-        f"Filters: {len(gap_results)} total → "
-        f"{rejected['gap']} gap · {rejected['price']} price · "
-        f"{rejected['volume']} volume · {rejected['turnover']} turnover · "
-        f"{rejected['be']} BE → {len(passed)} passed",
+        f"Filters: {len(gap_results)} stocks scanned | "
+        f"gap={rejected['gap']} rejected | price={rejected['price']} rejected | "
+        f"BE={rejected['be']} excluded | {len(passed)} qualify",
         db)
 
-    # Sort by absolute gap % descending — biggest movers first
+    # Sort by absolute gap% descending — biggest movers first
     passed.sort(key=lambda x: abs(x["gap_pct"]), reverse=True)
-
     selected = passed[:max_n]
-    _log(run, f"Selected top {len(selected)} of {len(passed)} qualifying stocks", db)
+
+    _log(run,
+        f"Selected top {len(selected)}: " +
+        ", ".join(f"{s['symbol']} ({s['gap_pct']:+.2f}%)" for s in selected),
+        db)
+
     return selected
 
 
-# ── Entry trigger computation ─────────────────────────────────────────────────
+# ── Step 4: First candle entry triggers ──────────────────────────────────────
 
 async def _compute_entry(
     security_id: str,
-    strategy: AlgoStrategy,
-    token: str,
-    client_id: str,
+    strategy:    AlgoStrategy,
+    token:       str,
+    client_id:   str,
 ) -> Optional[dict]:
     candle = await fetch_first_candle(token, client_id, security_id)
     if not candle:
@@ -295,12 +321,12 @@ async def _compute_entry(
     }
 
 
-# ── Trail SL logic ────────────────────────────────────────────────────────────
+# ── Trail SL & exit ───────────────────────────────────────────────────────────
 
 def _check_exit(
-    stock: AlgoStock,
-    ltp: float,
-    strategy: AlgoStrategy,
+    stock:       AlgoStock,
+    ltp:         float,
+    strategy:    AlgoStrategy,
     trail_steps: list,
 ) -> tuple[bool, str]:
     entry  = float(stock.entry_price or 0)
@@ -309,9 +335,8 @@ def _check_exit(
     if one_r <= 0 or entry <= 0:
         return False, ""
 
-    direction = stock.entry_direction
     pnl_r = (
-        (ltp - entry) / one_r if direction == "BUY"
+        (ltp - entry) / one_r if stock.entry_direction == "BUY"
         else (entry - ltp)    / one_r
     )
 
@@ -325,12 +350,12 @@ def _check_exit(
             break
 
     sl_price = (
-        entry + (locked_r * one_r) if direction == "BUY"
+        entry + (locked_r * one_r) if stock.entry_direction == "BUY"
         else entry - (locked_r * one_r)
     )
 
-    if direction == "BUY"  and ltp <= sl_price: return True, "SL"
-    if direction == "SELL" and ltp >= sl_price: return True, "SL"
+    if stock.entry_direction == "BUY"  and ltp <= sl_price: return True, "SL"
+    if stock.entry_direction == "SELL" and ltp >= sl_price: return True, "SL"
     return False, ""
 
 
@@ -348,7 +373,7 @@ def _update_daily_pnl(profile_id: str, pnl: float, db: Session):
     today = date.today()
     row   = db.query(DailyPnl).filter(
         DailyPnl.client_profile_id == profile_id,
-        DailyPnl.date == today,
+        DailyPnl.date              == today,
     ).first()
     if row:
         row.closed_pnl  = float(row.closed_pnl  or 0) + pnl
@@ -395,39 +420,50 @@ async def _monitor_tick(db: Session, token: str, client_id: str):
         except Exception:
             trail_steps = []
 
+        # Watching → check if trigger hit
         if stock.status == "watching":
             buy_t  = float(stock.buy_trigger  or 0)
             sell_t = float(stock.sell_trigger or 0)
 
+            entered = False
             if not strategy.gap_direction_bias:
-                if buy_t  and ltp >= buy_t:
-                    stock.status = "entered"; stock.entry_direction = "BUY"
-                    stock.entry_price = ltp; run.stocks_traded = (run.stocks_traded or 0) + 1
-                    _log(run, f"PAPER BUY  {stock.symbol} @ ₹{ltp:.2f} (trigger ₹{buy_t:.2f})", db)
+                # OCO — either side triggers
+                if buy_t and ltp >= buy_t:
+                    stock.entry_direction = "BUY";  entered = True
                 elif sell_t and ltp <= sell_t:
-                    stock.status = "entered"; stock.entry_direction = "SELL"
-                    stock.entry_price = ltp; run.stocks_traded = (run.stocks_traded or 0) + 1
-                    _log(run, f"PAPER SELL {stock.symbol} @ ₹{ltp:.2f} (trigger ₹{sell_t:.2f})", db)
+                    stock.entry_direction = "SELL"; entered = True
             else:
+                # Only enter in gap direction
                 if stock.direction == "UP"   and buy_t  and ltp >= buy_t:
-                    stock.status = "entered"; stock.entry_direction = "BUY"
-                    stock.entry_price = ltp; run.stocks_traded = (run.stocks_traded or 0) + 1
-                    _log(run, f"PAPER BUY  {stock.symbol} @ ₹{ltp:.2f}", db)
+                    stock.entry_direction = "BUY";  entered = True
                 elif stock.direction == "DOWN" and sell_t and ltp <= sell_t:
-                    stock.status = "entered"; stock.entry_direction = "SELL"
-                    stock.entry_price = ltp; run.stocks_traded = (run.stocks_traded or 0) + 1
-                    _log(run, f"PAPER SELL {stock.symbol} @ ₹{ltp:.2f}", db)
+                    stock.entry_direction = "SELL"; entered = True
+
+            if entered:
+                stock.status      = "entered"
+                stock.entry_price = ltp
+                run.stocks_traded = (run.stocks_traded or 0) + 1
+                _log(run,
+                    f"PAPER {stock.entry_direction} {stock.symbol} @ ₹{ltp:.2f} "
+                    f"(trigger ₹{buy_t if stock.entry_direction == 'BUY' else sell_t:.2f})",
+                    db)
 
             db.commit()
             continue
 
+        # Entered → check trail SL / target exit
         if stock.status == "entered" and stock.entry_price and stock.entry_direction:
             should_exit, reason = _check_exit(stock, ltp, strategy, trail_steps)
             if should_exit:
-                pnl = _calc_pnl(stock, ltp)
-                stock.status = "exited"; stock.exit_price = ltp; stock.pnl = pnl
-                run.total_pnl = float(run.total_pnl or 0) + pnl
-                _log(run, f"EXIT {stock.symbol} @ ₹{ltp:.2f} [{reason}] P&L: {pnl:+.2f}", db)
+                pnl          = _calc_pnl(stock, ltp)
+                stock.status = "exited"
+                stock.exit_price = ltp
+                stock.pnl        = pnl
+                run.total_pnl    = float(run.total_pnl or 0) + pnl
+                _log(run,
+                    f"EXIT {stock.symbol} @ ₹{ltp:.2f} [{reason}] "
+                    f"P&L: {pnl:+.2f}",
+                    db)
                 _update_daily_pnl(stock.client_profile_id, pnl, db)
 
         db.commit()
@@ -436,21 +472,27 @@ async def _monitor_tick(db: Session, token: str, client_id: str):
 # ── EOD force exit ────────────────────────────────────────────────────────────
 
 async def _force_exit_all(db: Session, token: str, client_id: str):
-    print("[algo] 3:20 PM force-exit all open paper positions")
-    stocks  = db.query(AlgoStock).filter(AlgoStock.status == "entered").all()
+    print("[algo] 3:20 PM — force-exiting all open paper positions")
+    stocks  = db.query(AlgoStock).filter(AlgoStock.status.in_(["watching","entered"])).all()
     if not stocks:
         return
+
     sec_ids = list({s.security_id for s in stocks})
     ltp_map = await fetch_ltp(token, client_id, sec_ids)
+
     for stock in stocks:
         ltp = ltp_map.get(str(stock.security_id), float(stock.entry_price or 0))
-        pnl = _calc_pnl(stock, ltp)
-        stock.status = "exited"; stock.exit_price = ltp; stock.pnl = pnl
+        pnl = _calc_pnl(stock, ltp) if stock.status == "entered" else 0
+        stock.status     = "exited"
+        stock.exit_price = ltp
+        stock.pnl        = pnl
         run = db.query(AlgoRun).filter(AlgoRun.id == stock.run_id).first()
         if run:
             run.total_pnl = float(run.total_pnl or 0) + pnl
             _log(run, f"FORCE EXIT {stock.symbol} @ ₹{ltp:.2f} [EOD] P&L: {pnl:+.2f}", db)
-        _update_daily_pnl(stock.client_profile_id, pnl, db)
+        if pnl != 0:
+            _update_daily_pnl(stock.client_profile_id, pnl, db)
+
     db.commit()
     print(f"[algo] Force-exited {len(stocks)} positions")
 
@@ -458,7 +500,10 @@ async def _force_exit_all(db: Session, token: str, client_id: str):
 # ── Main daily run ────────────────────────────────────────────────────────────
 
 async def run_daily_algo():
-    """Full daily algo cycle. Called by scheduler at 9:00 AM IST on weekdays."""
+    """
+    Full daily paper trading cycle.
+    Scheduled at 8:45 AM IST by morning_scheduler in main.py.
+    """
     db = SessionLocal()
     try:
         clients = _subscribed_clients(db)
@@ -469,7 +514,7 @@ async def run_daily_algo():
         print(f"[algo] Starting daily run for {len(clients)} client(s)")
         token, master_client_id = await get_master_token(db)
 
-        # Create today's runs
+        # Create today's run records
         runs = {}
         for profile, strategy in clients:
             run = _get_or_create_run(profile.id, strategy.id, db)
@@ -478,51 +523,47 @@ async def run_daily_algo():
             db.commit()
             runs[profile.id] = (run, strategy)
 
-        # ── Phase 1: Load universe + pre-open scan ──────────────────────
-        # Each client may have a different universe — scan union of all
-        # then filter per client to avoid duplicate API calls
-
-        all_sec_ids = set()
+        # Load all universes — scan union of all to minimise API calls
         client_universes = {}
+        all_meta         = {}   # security_id → { symbol, series, lot_size }
         for profile, strategy in clients:
             universe = _load_universe(strategy, db)
             client_universes[profile.id] = universe
-            all_sec_ids.update(u["security_id"] for u in universe)
+            for u in universe:
+                all_meta[u["security_id"]] = u
 
-        _log(runs[clients[0][0].id][0],
-             f"Combined universe: {len(all_sec_ids)} unique stocks across all clients", db)
+        combined_universe = list(all_meta.values())
+        print(f"[algo] Combined universe: {len(combined_universe)} unique stocks")
 
-        # Scan all unique security IDs once
-        meta_universe = []
-        for sid in all_sec_ids:
-            # Find meta from any client's universe
-            for cid, univ in client_universes.items():
-                m = next((u for u in univ if u["security_id"] == sid), None)
-                if m:
-                    meta_universe.append(m)
-                    break
+        # ── STEP 1: 8:45 AM — prev close snapshot ──────────────────────
+        await _wait_until(8, 45, 0, "(prev close snapshot)")
+        token, master_client_id = await get_master_token(db)
+        prev_close_snap = await _fetch_prev_close_snapshot(
+            token, master_client_id, combined_universe
+        )
+        for _, (run, _) in runs.items():
+            _log(run, f"8:45 AM snapshot: {len(prev_close_snap)} stocks captured", db)
 
-        gap_results = await _preopen_scan(token, master_client_id, meta_universe)
+        # ── STEP 2: 9:12:30 — opening price scan ───────────────────────
+        await _wait_until(9, 12, 30, "(opening price scan)")
+        token, master_client_id = await get_master_token(db)
+        opening_prices = await _fetch_opening_prices(
+            token, master_client_id, combined_universe
+        )
 
-        # Apply per-client filters and store selected stocks
+        # Compute gaps for full universe
+        all_gaps = _compute_gaps(prev_close_snap, opening_prices, combined_universe)
+        print(f"[algo] Gap computed for {len(all_gaps)} stocks")
+
+        # ── STEP 3: Apply per-client filters → select top N ────────────
         for profile, strategy in clients:
             run, strat = runs[profile.id]
-            universe   = client_universes[profile.id]
-            run.stocks_scanned = len(universe)
 
-            # Filter gap_results to only this client's universe
-            client_sec_ids = {u["security_id"] for u in universe}
-            client_gaps    = {
-                sid: d for sid, d in gap_results.items()
-                if sid in client_sec_ids
-            }
+            # Filter gap_results to this client's universe only
+            client_sids = {u["security_id"] for u in client_universes[profile.id]}
+            client_gaps = {sid: d for sid, d in all_gaps.items() if sid in client_sids}
 
-            # Enrich with series info from universe
-            sid_meta = {u["security_id"]: u for u in universe}
-            for sid in client_gaps:
-                client_gaps[sid]["series"]   = sid_meta.get(sid, {}).get("series", "EQ")
-                client_gaps[sid]["lot_size"]  = sid_meta.get(sid, {}).get("lot_size", 1)
-
+            run.stocks_scanned = len(client_sids)
             selected = _apply_filters(client_gaps, strat, run, db)
             run.stocks_selected = len(selected)
             db.commit()
@@ -546,15 +587,8 @@ async def run_daily_algo():
                     ))
             db.commit()
 
-        # ── Phase 2: Wait for 9:15 AM ──────────────────────────────────
-        now_ist  = datetime.now(IST)
-        open_ist = now_ist.replace(hour=9, minute=15, second=30, microsecond=0)
-        wait_sec = (open_ist - now_ist).total_seconds()
-        if 0 < wait_sec < 900:
-            print(f"[algo] Waiting {wait_sec:.0f}s for market open...")
-            await asyncio.sleep(wait_sec)
-
-        # ── Phase 3: First candle entry ────────────────────────────────
+        # ── STEP 4: 9:15:30 — first 1-min candle ───────────────────────
+        await _wait_until(9, 15, 30, "(first candle)")
         token, master_client_id = await get_master_token(db)
 
         for profile, strategy in clients:
@@ -579,17 +613,20 @@ async def run_daily_algo():
                     stock.sell_trigger  = entry["sell_trigger"]
                     stock.quantity      = entry["quantity"]
                     _log(run,
-                        f"{stock.symbol}: BUY ₹{entry['buy_trigger']:.2f} | "
-                        f"SELL ₹{entry['sell_trigger']:.2f} | Qty {entry['quantity']}", db)
+                        f"{stock.symbol}: candle close ₹{entry['candle_close']:.2f} | "
+                        f"BUY trigger ₹{entry['buy_trigger']:.2f} | "
+                        f"SELL trigger ₹{entry['sell_trigger']:.2f} | "
+                        f"Qty {entry['quantity']}",
+                        db)
                 else:
                     stock.status = "cancelled"
-                    _log(run, f"{stock.symbol}: No candle data — skipped", db)
+                    _log(run, f"{stock.symbol}: No candle data yet — skipped", db)
                 db.commit()
                 await asyncio.sleep(0.3)
 
-        # ── Phase 4: Monitor until 3:20 PM ────────────────────────────
+        # ── STEP 5: Monitor loop until 3:20 PM ─────────────────────────
         eod_ist = datetime.now(IST).replace(hour=15, minute=20, second=0, microsecond=0)
-        print("[algo] Monitor loop started")
+        print("[algo] Monitor loop started (every 5s)")
 
         while datetime.now(IST) < eod_ist:
             await asyncio.sleep(5)
@@ -599,22 +636,24 @@ async def run_daily_algo():
             except Exception as e:
                 print(f"[algo] Monitor tick error: {e}")
 
+            # Stop early if all positions closed
             open_count = db.query(AlgoStock).filter(
                 AlgoStock.status.in_(["watching", "entered"])
             ).count()
             if open_count == 0:
-                print("[algo] All positions closed — stopping monitor")
+                print("[algo] All positions closed — stopping monitor loop")
                 break
 
-        # ── Phase 5: EOD force exit ────────────────────────────────────
+        # ── STEP 6: 3:20 PM EOD force exit ─────────────────────────────
         token, master_client_id = await get_master_token(db)
         await _force_exit_all(db, token, master_client_id)
 
+        # Mark all runs done
         for profile, _ in clients:
             run, _ = runs[profile.id]
             run.status      = "done"
             run.finished_at = datetime.now(timezone.utc)
-            _log(run, f"Run complete. Total P&L: ₹{run.total_pnl:.2f}", db)
+            _log(run, f"Run complete. Total P&L: ₹{float(run.total_pnl or 0):.2f}", db)
 
         print("[algo] Daily run complete")
 
