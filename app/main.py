@@ -8,38 +8,66 @@ from app.core.config import get_settings
 from app.core.database import create_tables, SessionLocal
 from app.core.bootstrap import create_master_if_needed
 from app.routers import auth, clients, credentials, trading, algo
-from app.routers import master_account
+from app.routers import master_account, universe
 from app.services.token_manager import scheduled_morning_refresh
 from app.services.algo_engine import run_daily_algo
+from app.services.scrip_downloader import download_and_update
 
 settings = get_settings()
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-async def algo_scheduler():
+async def morning_scheduler():
     """
-    Fires run_daily_algo() every weekday at 9:00 AM IST.
-    Runs only for paper trading clients initially.
+    Every weekday at 8:00 AM IST:
+      1. Download + update scrip master (takes ~3-5s)
+      2. Refresh all client Dhan tokens
+    Then at 9:00 AM IST:
+      3. Run daily algo for all subscribed clients
     """
     while True:
         now_ist = datetime.now(IST)
 
-        # Next 9:00 AM IST on a weekday
-        target = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
-        if now_ist >= target:
-            target = target + timedelta(days=1)
+        # Next 8:00 AM IST weekday
+        target_8 = now_ist.replace(hour=8, minute=0, second=0, microsecond=0)
+        if now_ist >= target_8:
+            target_8 += timedelta(days=1)
+        while target_8.weekday() >= 5:
+            target_8 += timedelta(days=1)
 
-        # Skip weekends
-        while target.weekday() >= 5:  # 5=Sat, 6=Sun
-            target += timedelta(days=1)
-
-        wait_secs = (target - now_ist).total_seconds()
-        print(f"[scheduler] Next algo run in {wait_secs/3600:.1f}h "
-              f"(at {target.strftime('%Y-%m-%d %H:%M IST')})")
-
+        wait_secs = (target_8 - now_ist).total_seconds()
+        print(f"[scheduler] Next morning tasks in {wait_secs/3600:.1f}h "
+              f"(at {target_8.strftime('%Y-%m-%d %H:%M IST')})")
         await asyncio.sleep(wait_secs)
 
-        print(f"[scheduler] === Starting daily algo run {target.strftime('%Y-%m-%d')} ===")
+        # ── 8:00 AM — scrip master + token refresh ───────────────────────
+        print(f"[scheduler] === 8:00 AM tasks starting {target_8.strftime('%Y-%m-%d')} ===")
+
+        # 1. Update scrip master
+        db = SessionLocal()
+        try:
+            result = await download_and_update(db)
+            print(f"[scheduler] Scrip master: {result.get('total_downloaded',0)} stocks updated")
+        except Exception as e:
+            print(f"[scheduler] Scrip master error: {e}")
+        finally:
+            db.close()
+
+        # 2. Refresh client tokens
+        try:
+            await scheduled_morning_refresh(SessionLocal)
+        except Exception as e:
+            print(f"[scheduler] Token refresh error: {e}")
+
+        # ── 9:00 AM — algo engine ─────────────────────────────────────────
+        now_ist  = datetime.now(IST)
+        target_9 = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
+        if now_ist < target_9:
+            wait = (target_9 - now_ist).total_seconds()
+            print(f"[scheduler] Waiting {wait:.0f}s until 9:00 AM for algo...")
+            await asyncio.sleep(wait)
+
+        print(f"[scheduler] === 9:00 AM algo run starting ===")
         try:
             await run_daily_algo()
         except Exception as e:
@@ -51,29 +79,22 @@ async def lifespan(app: FastAPI):
     create_tables()
     create_master_if_needed()
 
-    # Token refresh — 8 AM IST daily
-    token_task = asyncio.create_task(scheduled_morning_refresh(SessionLocal))
-    print("[startup] Token refresh scheduler started")
-
-    # Algo engine — 9 AM IST weekdays
-    algo_task = asyncio.create_task(algo_scheduler())
-    print("[startup] Algo scheduler started")
+    task = asyncio.create_task(morning_scheduler())
+    print("[startup] Morning scheduler started (8AM scrip + tokens, 9AM algo)")
 
     yield
 
-    token_task.cancel()
-    algo_task.cancel()
-    for t in [token_task, algo_task]:
-        try:
-            await t
-        except asyncio.CancelledError:
-            pass
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(
     title="WealthOcean Trading API",
     description="Algo trading platform — Dhan broker + WOI strategy",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -91,11 +112,12 @@ app.include_router(credentials.router)
 app.include_router(trading.router)
 app.include_router(algo.router)
 app.include_router(master_account.router)
+app.include_router(universe.router)
 
 
 @app.get("/", tags=["health"])
 def root():
-    return {"status": "ok", "service": "WealthOcean Trading API", "version": "1.2.0"}
+    return {"status": "ok", "service": "WealthOcean Trading API", "version": "1.3.0"}
 
 
 @app.get("/health", tags=["health"])
