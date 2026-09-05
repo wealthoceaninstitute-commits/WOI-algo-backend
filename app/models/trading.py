@@ -199,6 +199,14 @@ class AlgoStrategy(Base):
     gap_direction_bias    = Column(Boolean, default=False)        # False = OCO both sides
     sl_basis              = Column(String, default="trigger")     # "trigger" or "fill"
 
+    # ── Stock universe & filters ────────────────────────────────
+    universe_id           = Column(String, ForeignKey("stock_universes.id", ondelete="SET NULL"), nullable=True)
+    min_price             = Column(Numeric(10, 2), default=50.0)    # skip stocks below ₹50
+    max_price             = Column(Numeric(10, 2), default=10000.0) # skip stocks above ₹10,000
+    min_volume            = Column(Integer, default=500000)          # min prev day volume (shares)
+    min_turnover_cr       = Column(Numeric(10, 2), default=10.0)    # min prev day turnover (₹ crores)
+    exclude_be_series     = Column(Boolean, default=False)           # exclude BE/surveillance stocks
+
     created_at        = Column(DateTime(timezone=True), server_default=func.now())
     updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
 
