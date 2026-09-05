@@ -587,8 +587,8 @@ async def run_daily_algo():
                     ))
             db.commit()
 
-        # ── STEP 4: 9:15:30 — first 1-min candle ───────────────────────
-        await _wait_until(9, 15, 30, "(first candle)")
+        # ── STEP 4: 9:16:05 — first 1-min candle (candle closes at 9:16:00) ──
+        await _wait_until(9, 16, 5, "(first candle — 5s after 9:16:00 close)")
         token, master_client_id = await get_master_token(db)
 
         for profile, strategy in clients:
