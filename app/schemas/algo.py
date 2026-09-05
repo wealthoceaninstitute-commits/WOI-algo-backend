@@ -56,6 +56,14 @@ class AlgoStrategyRequest(BaseModel):
     gap_direction_bias: bool = False
     sl_basis: str = "trigger"               # "trigger" | "fill"
 
+    # Stock universe & filters
+    universe_id:       Optional[str]   = None
+    min_price:         float           = Field(50.0,    ge=0,      le=100000)
+    max_price:         float           = Field(10000.0, ge=1,      le=1000000)
+    min_volume:        int             = Field(500000,  ge=0)
+    min_turnover_cr:   float           = Field(10.0,    ge=0)
+    exclude_be_series: bool            = False
+
 
 class AlgoStrategyResponse(AlgoStrategyRequest):
     id: str
@@ -103,6 +111,12 @@ class AlgoStrategyResponse(AlgoStrategyRequest):
             max_reentry_attempts=m.max_reentry_attempts,
             gap_direction_bias=m.gap_direction_bias,
             sl_basis=m.sl_basis,
+            universe_id=m.universe_id,
+            min_price=float(m.min_price) if m.min_price else 50.0,
+            max_price=float(m.max_price) if m.max_price else 10000.0,
+            min_volume=m.min_volume or 500000,
+            min_turnover_cr=float(m.min_turnover_cr) if m.min_turnover_cr else 10.0,
+            exclude_be_series=m.exclude_be_series or False,
             created_at=m.created_at,
             updated_at=m.updated_at,
         )
