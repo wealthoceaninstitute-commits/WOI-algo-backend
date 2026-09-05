@@ -4,20 +4,24 @@ app/services/scrip_downloader.py
 Downloads Dhan instrument master and upserts into scrip_master table.
 Source: https://images.dhan.co/api-data/api-scrip-master.csv
 
-Column mapping (confirmed from actual CSV screenshot):
-  SEM_EXM_EXCH_ID       → exchange (NSE / BSE / MCX)
-  SEM_SEGMENT           → segment  (E = Equity)
-  SEM_SMST_SECURITY_ID  → security_id  ← primary key
-  SEM_INSTRUMENT_NAME   → instrument type (EQUITY / FUTIDX / OPTIDX etc)
-  SEM_TRADING_SYMBOL    → trading symbol (ARE&M, RELIANCE, etc)  ← col F
-  SEM_LOT_UNITS         → lot size
-  SEM_CUSTOM_SYMBOL     → display name / company short name
-  SEM_SERIES            → series (EQ / BE / SG / SM / IL etc)
-  SM_SYMBOL_NAME        → short symbol name
-  OL_NAME               → full company name
+Confirmed column names from actual CSV:
+  SEM_EXM_EXCH_ID        → exchange (NSE / BSE / MCX)
+  SEM_SEGMENT            → E = Equity segment
+  SEM_SMST_SECURITY_ID   → security_id (Dhan's unique ID)
+  SEM_INSTRUMENT_NAME    → EQUITY / FUTIDX / OPTIDX etc
+  SEM_TRADING_SYMBOL     → trading symbol e.g. RELIANCE, HFCL  ← col F
+  SEM_LOT_UNITS          → lot size
+  SEM_CUSTOM_SYMBOL      → display name
+  SEM_TICK_SIZE          → tick size
+  SEM_SERIES             → EQ / BE / SG / SM / MF etc
+  SM_SYMBOL_NAME         → short symbol name
 
-Filter: NSE + E segment + EQUITY instrument + EQ series only
-This gives ~1,800 clean NSE equity stocks (excludes bonds, ETFs, SME, BE series).
+Filter: NSE + E segment + EQUITY instrument + (EQ or BE) series
+  EQ = regular equity (2,677 stocks)
+  BE = trade-for-trade surveillance (242 stocks — e.g. HFCL, HEG — fully tradeable)
+  All other series excluded (SG=bonds, SM=SME, MF=mutual funds, etc.)
+
+Total stored: ~2,919 NSE equity stocks
 """
 
 import io
@@ -28,22 +32,23 @@ from sqlalchemy.orm import Session
 
 from app.models.scrip_master import ScripMaster
 
-SCRIP_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
-TIMEOUT   = 60.0
+SCRIP_URL      = "https://images.dhan.co/api-data/api-scrip-master.csv"
+TIMEOUT        = 60.0
+ALLOWED_SERIES = {"EQ", "BE"}   # EQ = normal, BE = trade-for-trade (both tradeable)
 
 
 async def download_and_update(db: Session) -> dict:
     """
-    Download Dhan scrip master CSV and upsert NSE EQ stocks into DB.
-    Returns summary dict.
+    Download Dhan scrip master CSV and upsert NSE equity stocks into DB.
+    Keeps EQ and BE series — covers all Nifty 500 stocks including surveillance ones.
     """
-    print("[scrip] Downloading Dhan instrument master from Dhan CDN...")
+    print("[scrip] Downloading Dhan instrument master...")
 
     try:
         async with httpx.AsyncClient(
             timeout=TIMEOUT,
             follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"},  # required by Dhan CDN
+            headers={"User-Agent": "Mozilla/5.0"},
         ) as c:
             resp = await c.get(SCRIP_URL)
 
@@ -60,63 +65,40 @@ async def download_and_update(db: Session) -> dict:
         print(f"[scrip] {msg}")
         return {"success": False, "message": msg}
 
-    # Parse CSV
     rows     = []
     skipped  = 0
     errors   = 0
     today    = date.today()
 
     try:
-        reader = csv.DictReader(io.StringIO(content))
+        reader  = csv.DictReader(io.StringIO(content))
         headers = reader.fieldnames or []
-        print(f"[scrip] CSV columns: {headers[:10]}...")  # log first 10 cols for debugging
+        print(f"[scrip] Columns found: {headers}")
 
         for row in reader:
             try:
-                # ── Filters ───────────────────────────────────────────────
-                exch       = (row.get("SEM_EXM_EXCH_ID")    or "").strip().upper()
-                segment    = (row.get("SEM_SEGMENT")          or "").strip().upper()
-                instrument = (row.get("SEM_INSTRUMENT_NAME")  or "").strip().upper()
-                series     = (row.get("SEM_SERIES")           or
-                              row.get("SM_SERIES")             or "").strip().upper()
+                exch       = (row.get("SEM_EXM_EXCH_ID")       or "").strip().upper()
+                segment    = (row.get("SEM_SEGMENT")             or "").strip().upper()
+                instrument = (row.get("SEM_INSTRUMENT_NAME")     or "").strip().upper()
+                series     = (row.get("SEM_SERIES")              or "").strip().upper()
 
-                # Keep only NSE equity EQ series
-                if exch != "NSE":
+                # Keep only NSE equity in EQ or BE series
+                if exch != "NSE" or segment != "E" or instrument != "EQUITY":
                     skipped += 1
                     continue
-                if segment != "E":
-                    skipped += 1
-                    continue
-                if instrument != "EQUITY":
-                    skipped += 1
-                    continue
-                if series != "EQ":
+                if series not in ALLOWED_SERIES:
                     skipped += 1
                     continue
 
-                # ── Extract fields ────────────────────────────────────────
                 security_id = (row.get("SEM_SMST_SECURITY_ID") or "").strip()
-
-                # Trading symbol — column F in the CSV (SEM_TRADING_SYMBOL)
-                symbol = (
-                    row.get("SEM_TRADING_SYMBOL") or
-                    row.get("SM_SYMBOL_NAME")     or
-                    ""
-                ).strip().upper()
-
-                # Company name — OL_NAME is the full name
-                name = (
-                    row.get("OL_NAME")            or
-                    row.get("SEM_CUSTOM_SYMBOL")  or
-                    row.get("SM_FULL_NAME")        or
-                    symbol
-                ).strip()
-
-                isin = (row.get("SM_ISIN_NUMBER") or
-                        row.get("SEM_ISIN")        or "").strip()
+                # SEM_TRADING_SYMBOL is the NSE trading symbol (col F)
+                symbol      = (row.get("SEM_TRADING_SYMBOL")    or
+                               row.get("SM_SYMBOL_NAME")         or "").strip().upper()
+                name        = (row.get("SEM_CUSTOM_SYMBOL")      or symbol).strip()
+                isin        = (row.get("SM_ISIN_NUMBER")         or "").strip()
 
                 try:
-                    lot_size = int(float(row.get("SEM_LOT_UNITS") or 1))
+                    lot_size = max(1, int(float(row.get("SEM_LOT_UNITS") or 1)))
                 except Exception:
                     lot_size = 1
 
@@ -134,37 +116,31 @@ async def download_and_update(db: Session) -> dict:
                     "symbol":           symbol,
                     "name":             name,
                     "exchange_segment": "NSE_EQ",
-                    "series":           "EQ",
+                    "series":           series,
                     "isin":             isin,
                     "lot_size":         lot_size,
                     "tick_size":        tick_size,
                     "last_updated":     today,
                 })
 
-            except Exception as e:
+            except Exception:
                 errors += 1
                 continue
 
     except Exception as e:
-        msg = f"CSV parse error: {e}"
-        print(f"[scrip] {msg}")
-        return {"success": False, "message": msg}
+        return {"success": False, "message": f"CSV parse error: {e}"}
 
     if not rows:
-        # Column names may have changed — log all headers for debugging
-        msg = (
-            f"No NSE EQ stocks found after filtering. "
-            f"CSV may have different column names. "
-            f"Check headers: {headers}"
-        )
-        print(f"[scrip] {msg}")
-        return {"success": False, "message": msg}
+        return {
+            "success": False,
+            "message": f"No NSE EQ/BE stocks found. CSV columns: {headers}",
+        }
 
-    print(f"[scrip] Parsed {len(rows)} NSE EQ stocks (skipped {skipped}, errors {errors})")
+    print(f"[scrip] Parsed {len(rows)} NSE EQ+BE stocks ({skipped} skipped, {errors} errors)")
 
-    # Upsert into DB
-    inserted = 0
-    updated  = 0
+    # Upsert
+    inserted  = 0
+    updated   = 0
     db_errors = 0
 
     for r in rows:
@@ -172,22 +148,19 @@ async def download_and_update(db: Session) -> dict:
             existing = db.query(ScripMaster).filter(
                 ScripMaster.security_id == r["security_id"]
             ).first()
-
             if existing:
-                existing.symbol           = r["symbol"]
-                existing.name             = r["name"]
-                existing.exchange_segment = r["exchange_segment"]
-                existing.series           = r["series"]
-                existing.isin             = r["isin"]
-                existing.lot_size         = r["lot_size"]
-                existing.tick_size        = r["tick_size"]
-                existing.last_updated     = r["last_updated"]
+                existing.symbol       = r["symbol"]
+                existing.name         = r["name"]
+                existing.series       = r["series"]
+                existing.isin         = r["isin"]
+                existing.lot_size     = r["lot_size"]
+                existing.tick_size    = r["tick_size"]
+                existing.last_updated = r["last_updated"]
                 updated += 1
             else:
                 db.add(ScripMaster(**r))
                 inserted += 1
-
-        except Exception as e:
+        except Exception:
             db_errors += 1
             db.rollback()
             continue
@@ -207,11 +180,7 @@ async def download_and_update(db: Session) -> dict:
         "errors":           errors + db_errors,
         "updated_at":       datetime.now(timezone.utc).isoformat(),
     }
-    print(
-        f"[scrip] Done — {len(rows)} total | "
-        f"inserted={inserted} updated={updated} "
-        f"skipped={skipped} errors={errors+db_errors}"
-    )
+    print(f"[scrip] Done — {len(rows)} stocks | inserted={inserted} updated={updated}")
     return summary
 
 
