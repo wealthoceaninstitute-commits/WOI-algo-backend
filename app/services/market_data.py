@@ -2,13 +2,20 @@
 app/services/market_data.py
 
 Fetches market data from Dhan using the MASTER data account token.
-Used exclusively by the algo engine — no client credentials involved.
+Built directly from https://dhanhq.co/docs/v2/market-quote/
+                  and https://dhanhq.co/docs/v2/historical-data/
 
-Covers:
-  - Quote fetch (batch, for gap scanning)
-  - Intraday candle data (1-min OHLCV)
-  - Pre-open price fetch
+Endpoints:
+  POST /v2/marketfeed/ltp      — LTP only, up to 1000 instruments
+  POST /v2/marketfeed/ohlc     — OHLC + LTP, up to 1000 instruments
+  POST /v2/charts/intraday     — 1-min candles
+
+Request body: { "NSE_EQ": [11536, 1333] }   ← INTEGER security IDs
+Response:     { "data": { "NSE_EQ": { "11536": { "last_price": ... } } } }
+
+Rate limit: 1 req/sec on marketfeed. client-id header required.
 """
+
 import httpx
 from datetime import datetime, date, timezone, timedelta
 from typing import Optional
@@ -22,14 +29,18 @@ API_BASE = "https://api.dhan.co/v2"
 TIMEOUT  = 20.0
 
 
-# ── Token management ──────────────────────────────────────────────────────────
-
 def _get_account(db: Session) -> Optional[MasterDataAccount]:
     return db.query(MasterDataAccount).first()
 
 
 def _token_valid(acc: MasterDataAccount) -> bool:
-    if not acc or not acc.is_active or not acc.access_token:
+    if not acc or not acc.is_active:
+        return False
+    try:
+        token = decrypt(acc.access_token)
+        if not token or not token.strip():
+            return False
+    except Exception:
         return False
     if not acc.token_expires_at:
         return False
@@ -40,26 +51,26 @@ def _token_valid(acc: MasterDataAccount) -> bool:
     return now < (expires - timedelta(minutes=30))
 
 
-async def get_master_token(db: Session) -> str:
+async def get_master_token(db: Session) -> tuple[str, str]:
     """
-    Return a valid master data account token.
+    Return (access_token, client_id).
     Auto-refreshes via TOTP if expired.
     """
     acc = _get_account(db)
     if not acc:
-        raise RuntimeError("No master data account configured. Set it up in Master → Settings → Data Account.")
+        raise RuntimeError(
+            "No master data account configured. "
+            "Go to Master → Settings → Data Account to set it up."
+        )
+    client_id = decrypt(acc.dhan_client_id)
 
     if _token_valid(acc):
-        return decrypt(acc.access_token)
+        return decrypt(acc.access_token), client_id
 
-    # Refresh via TOTP
-    client_id   = decrypt(acc.dhan_client_id)
     pin         = decrypt(acc.pin)
     totp_secret = decrypt(acc.totp_secret)
-
-    print("[market_data] Refreshing master data account token...")
+    print("[market_data] Refreshing master token...")
     result = await generate_access_token(client_id, pin, totp_secret)
-
     if not result["success"]:
         raise RuntimeError(f"Master token refresh failed: {result['message']}")
 
@@ -71,178 +82,141 @@ async def get_master_token(db: Session) -> str:
     acc.token_expires_at = now + timedelta(hours=24)
     db.commit()
     print("[market_data] Master token refreshed")
-    return result["access_token"]
+    return result["access_token"], client_id
 
 
-def _headers(token: str) -> dict:
+def _h(token: str, client_id: str) -> dict:
     return {
         "access-token": token,
+        "client-id":    client_id,
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept":       "application/json",
     }
-
-
-# ── Quote fetch (batch) ───────────────────────────────────────────────────────
-
-async def fetch_quotes_batch(
-    token: str,
-    security_ids: list[str],
-    exchange_segment: str = "NSE_EQ",
-) -> dict:
-    """
-    Fetch LTP + OHLC for a batch of securities.
-    Dhan allows up to 1000 per request.
-    Returns: { security_id: { ltp, open, high, low, close, prev_close, ... } }
-    """
-    url  = f"{API_BASE}/marketfeed/ltp"
-    body = {exchange_segment: security_ids}
-
-    async with httpx.AsyncClient(headers=_headers(token), timeout=TIMEOUT) as c:
-        resp = await c.post(url, json=body)
-
-    if resp.status_code != 200:
-        print(f"[market_data] Quote batch failed {resp.status_code}: {resp.text[:200]}")
-        return {}
-
-    data   = resp.json()
-    result = {}
-    for seg, items in (data.get("data") or {}).items():
-        for item in (items or []):
-            sid = str(item.get("securityId", ""))
-            if sid:
-                result[sid] = {
-                    "ltp":        item.get("lastTradedPrice", 0),
-                    "open":       item.get("openPrice", 0),
-                    "high":       item.get("highPrice", 0),
-                    "low":        item.get("lowPrice", 0),
-                    "close":      item.get("closingPrice", 0),
-                    "prev_close": item.get("previousClosePrice", 0),
-                    "volume":     item.get("totalTradedVolume", 0),
-                    "symbol":     item.get("tradingSymbol", ""),
-                }
-    return result
 
 
 async def fetch_ohlc_batch(
     token: str,
+    client_id: str,
     security_ids: list[str],
     exchange_segment: str = "NSE_EQ",
 ) -> dict:
     """
-    Fetch OHLC data for gap calculation.
-    Returns: { security_id: { open, high, low, close, prev_close } }
+    POST /v2/marketfeed/ohlc
+    Returns: { sid_str: { ltp, open, high, low, prev_close } }
+    NOTE: ohlc.close in Dhan response = PREVIOUS DAY close price
     """
-    url  = f"{API_BASE}/marketfeed/ohlc"
-    body = {exchange_segment: security_ids}
-
-    async with httpx.AsyncClient(headers=_headers(token), timeout=TIMEOUT) as c:
-        resp = await c.post(url, json=body)
+    body = {exchange_segment: [int(s) for s in security_ids]}
+    async with httpx.AsyncClient(headers=_h(token, client_id), timeout=TIMEOUT) as c:
+        resp = await c.post(f"{API_BASE}/marketfeed/ohlc", json=body)
 
     if resp.status_code != 200:
-        print(f"[market_data] OHLC batch failed {resp.status_code}: {resp.text[:200]}")
+        print(f"[market_data] OHLC {resp.status_code}: {resp.text[:200]}")
         return {}
 
-    data   = resp.json()
-    result = {}
-    for seg, items in (data.get("data") or {}).items():
-        for item in (items or []):
-            sid = str(item.get("securityId", ""))
-            if sid:
-                result[sid] = {
-                    "open":       item.get("openPrice", 0),
-                    "high":       item.get("highPrice", 0),
-                    "low":        item.get("lowPrice", 0),
-                    "close":      item.get("closingPrice", 0),
-                    "prev_close": item.get("previousClosePrice", 0),
-                    "volume":     item.get("totalTradedVolume", 0),
-                    "symbol":     item.get("tradingSymbol", ""),
-                }
+    seg_data = (resp.json().get("data") or {}).get(exchange_segment, {})
+    result   = {}
+    for sid, item in seg_data.items():
+        ohlc = item.get("ohlc") or {}
+        result[str(sid)] = {
+            "ltp":        float(item.get("last_price") or 0),
+            "open":       float(ohlc.get("open")  or 0),
+            "high":       float(ohlc.get("high")  or 0),
+            "low":        float(ohlc.get("low")   or 0),
+            "prev_close": float(ohlc.get("close") or 0),  # prev day close
+        }
     return result
 
 
-async def fetch_ltp(token: str, security_ids: list[str], exchange_segment: str = "NSE_EQ") -> dict:
-    """Fetch LTP only — lightweight, used for monitoring open positions."""
-    url  = f"{API_BASE}/marketfeed/ltp"
-    body = {exchange_segment: security_ids}
-
-    async with httpx.AsyncClient(headers=_headers(token), timeout=TIMEOUT) as c:
-        resp = await c.post(url, json=body)
+async def fetch_ltp(
+    token: str,
+    client_id: str,
+    security_ids: list[str],
+    exchange_segment: str = "NSE_EQ",
+) -> dict:
+    """
+    POST /v2/marketfeed/ltp
+    Returns: { sid_str: ltp_float }
+    """
+    body = {exchange_segment: [int(s) for s in security_ids]}
+    async with httpx.AsyncClient(headers=_h(token, client_id), timeout=TIMEOUT) as c:
+        resp = await c.post(f"{API_BASE}/marketfeed/ltp", json=body)
 
     if resp.status_code != 200:
+        print(f"[market_data] LTP {resp.status_code}: {resp.text[:200]}")
         return {}
 
-    data   = resp.json()
-    result = {}
-    for seg, items in (data.get("data") or {}).items():
-        for item in (items or []):
-            sid = str(item.get("securityId", ""))
-            if sid:
-                result[sid] = float(item.get("lastTradedPrice", 0))
-    return result
+    seg_data = (resp.json().get("data") or {}).get(exchange_segment, {})
+    return {str(sid): float(item.get("last_price") or 0) for sid, item in seg_data.items()}
 
-
-# ── Intraday candles ──────────────────────────────────────────────────────────
 
 async def fetch_intraday_candles(
     token: str,
+    client_id: str,
     security_id: str,
     exchange_segment: str = "NSE_EQ",
-    instrument_type: str = "EQUITY",
+    instrument: str = "EQUITY",
+    interval: str = "1",
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
 ) -> list[dict]:
     """
-    Fetch today's 1-min candles for a security.
-    Returns list of { timestamp, open, high, low, close, volume }
+    POST /v2/charts/intraday
+    fromDate/toDate format: "YYYY-MM-DD HH:MM:SS"
+    Returns: [{ timestamp, open, high, low, close, volume }]
     """
-    today = date.today().strftime("%Y-%m-%d")
-    url   = f"{API_BASE}/charts/intraday"
-    body  = {
-        "securityId":    security_id,
+    today   = date.today()
+    from_dt = from_date or f"{today} 09:15:00"
+    to_dt   = to_date   or f"{today} 15:30:00"
+
+    body = {
+        "securityId":      security_id,
         "exchangeSegment": exchange_segment,
-        "instrument":    instrument_type,
-        "interval":      "1",
-        "fromDate":      today,
-        "toDate":        today,
+        "instrument":      instrument,
+        "interval":        interval,
+        "oi":              False,
+        "fromDate":        from_dt,
+        "toDate":          to_dt,
     }
 
-    async with httpx.AsyncClient(headers=_headers(token), timeout=TIMEOUT) as c:
-        resp = await c.post(url, json=body)
+    async with httpx.AsyncClient(headers=_h(token, client_id), timeout=TIMEOUT) as c:
+        resp = await c.post(f"{API_BASE}/charts/intraday", json=body)
 
     if resp.status_code != 200:
-        print(f"[market_data] Candles failed {resp.status_code}: {resp.text[:200]}")
+        print(f"[market_data] Candles {resp.status_code}: {resp.text[:200]}")
         return []
 
-    data      = resp.json()
-    opens     = data.get("open", [])
-    highs     = data.get("high", [])
-    lows      = data.get("low", [])
-    closes    = data.get("close", [])
-    volumes   = data.get("volume", [])
-    timestamps= data.get("timestamp", [])
+    data = resp.json()
+    opens      = data.get("open",      [])
+    highs      = data.get("high",      [])
+    lows       = data.get("low",       [])
+    closes     = data.get("close",     [])
+    volumes    = data.get("volume",    [])
+    timestamps = data.get("timestamp", [])
 
-    candles = []
-    for i in range(len(closes)):
-        candles.append({
+    return [
+        {
             "timestamp": timestamps[i] if i < len(timestamps) else None,
-            "open":   float(opens[i])   if i < len(opens)   else 0,
-            "high":   float(highs[i])   if i < len(highs)   else 0,
-            "low":    float(lows[i])    if i < len(lows)    else 0,
-            "close":  float(closes[i])  if i < len(closes)  else 0,
-            "volume": int(volumes[i])   if i < len(volumes) else 0,
-        })
-
-    return candles
+            "open":   float(opens[i])  if i < len(opens)  else 0.0,
+            "high":   float(highs[i])  if i < len(highs)  else 0.0,
+            "low":    float(lows[i])   if i < len(lows)   else 0.0,
+            "close":  float(closes[i]) if i < len(closes) else 0.0,
+            "volume": int(volumes[i])  if i < len(volumes) else 0,
+        }
+        for i in range(len(closes))
+    ]
 
 
 async def fetch_first_candle(
     token: str,
+    client_id: str,
     security_id: str,
     exchange_segment: str = "NSE_EQ",
 ) -> Optional[dict]:
-    """
-    Fetch the first 1-min candle (9:15–9:16 AM) for a security.
-    Returns the candle dict or None if not yet available.
-    """
-    candles = await fetch_intraday_candles(token, security_id, exchange_segment)
-    if candles:
-        return candles[0]
-    return None
+    """First 1-min candle of the day (9:15–9:16 AM)."""
+    today = date.today()
+    candles = await fetch_intraday_candles(
+        token, client_id, security_id, exchange_segment,
+        from_date=f"{today} 09:15:00",
+        to_date=f"{today} 09:17:00",
+    )
+    return candles[0] if candles else None
