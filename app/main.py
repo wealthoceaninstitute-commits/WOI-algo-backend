@@ -59,15 +59,15 @@ async def morning_scheduler():
         except Exception as e:
             print(f"[scheduler] Token refresh error: {e}")
 
-        # ── 9:00 AM — algo engine ─────────────────────────────────────────
-        now_ist  = datetime.now(IST)
-        target_9 = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
-        if now_ist < target_9:
-            wait = (target_9 - now_ist).total_seconds()
-            print(f"[scheduler] Waiting {wait:.0f}s until 9:00 AM for algo...")
+        # ── 8:45 AM — algo engine (starts early for prev close snapshot) ──────
+        now_ist    = datetime.now(IST)
+        target_845 = now_ist.replace(hour=8, minute=45, second=0, microsecond=0)
+        if now_ist < target_845:
+            wait = (target_845 - now_ist).total_seconds()
+            print(f"[scheduler] Waiting {wait:.0f}s until 8:45 AM for algo...")
             await asyncio.sleep(wait)
 
-        print(f"[scheduler] === 9:00 AM algo run starting ===")
+        print(f"[scheduler] === 8:45 AM algo run starting ===")
         try:
             await run_daily_algo()
         except Exception as e:
