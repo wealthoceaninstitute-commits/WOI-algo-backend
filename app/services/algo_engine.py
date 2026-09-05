@@ -209,10 +209,11 @@ def _apply_filters(
     """
     gap_min    = float(strategy.gap_min)
     gap_max    = float(strategy.gap_max)
-    min_price  = float(strategy.min_price or 50)
-    max_price  = float(strategy.max_price or 10000)
-    min_vol    = int(strategy.min_volume or 0)
-    min_turn   = float(strategy.min_turnover_cr or 0)
+    # 0 = disabled for all filters except max_price (0 would block everything)
+    min_price  = float(strategy.min_price or 0)
+    max_price  = float(strategy.max_price or 0)   # 0 = no max limit
+    min_vol    = int(strategy.min_volume  or 0)   # 0 = no volume filter
+    min_turn   = float(strategy.min_turnover_cr or 0)  # 0 = no turnover filter
     excl_be    = bool(strategy.exclude_be_series)
     max_n      = int(strategy.max_stocks_per_day)
 
@@ -228,11 +229,16 @@ def _apply_filters(
 
         if not (gap_min <= gap <= gap_max):
             rejected["gap"] += 1; continue
-        if not (min_price <= prev <= max_price):
+        # Price filter — 0 = disabled
+        if min_price > 0 and prev < min_price:
             rejected["price"] += 1; continue
-        if vol < min_vol:
+        if max_price > 0 and prev > max_price:
+            rejected["price"] += 1; continue
+        # Volume filter — 0 = disabled
+        if min_vol > 0 and vol < min_vol:
             rejected["volume"] += 1; continue
-        if turn < min_turn:
+        # Turnover filter — 0 = disabled
+        if min_turn > 0 and turn < min_turn:
             rejected["turnover"] += 1; continue
         if excl_be and ser == "BE":
             rejected["be"] += 1; continue
