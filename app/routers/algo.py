@@ -21,6 +21,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from fastapi import BackgroundTasks
+from datetime import datetime, timezone
 from app.core.security import get_current_user, require_master
 from app.models.user import User
 from app.models.trading import ClientProfile, AlgoStrategy, AlgoRun, AlgoStock
@@ -357,3 +359,24 @@ def get_client_runs(
         .all()
     )
     return [_ser_run(r) for r in runs]
+
+
+# ── Manual trigger — master can force-start algo run ─────────────────────────
+
+@router.post("/trigger-run")
+async def trigger_algo_run(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_master),
+):
+    """
+    Manually trigger the algo run immediately.
+    Useful for testing or if scheduled run was missed.
+    Runs in background — returns immediately.
+    """
+    from app.services.algo_engine import run_daily_algo
+    background_tasks.add_task(run_daily_algo)
+    return {
+        "message": "Algo run triggered. Check Railway logs and client WOI Algo page for progress.",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
