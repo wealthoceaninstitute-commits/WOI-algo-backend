@@ -442,6 +442,7 @@ async def _monitor_tick(db: Session, token: str, client_id: str):
             if entered:
                 stock.status      = "entered"
                 stock.entry_price = ltp
+                stock.entry_time  = datetime.now(timezone.utc)
                 run.stocks_traded = (run.stocks_traded or 0) + 1
                 _log(run,
                     f"PAPER {stock.entry_direction} {stock.symbol} @ ₹{ltp:.2f} "
@@ -455,10 +456,12 @@ async def _monitor_tick(db: Session, token: str, client_id: str):
         if stock.status == "entered" and stock.entry_price and stock.entry_direction:
             should_exit, reason = _check_exit(stock, ltp, strategy, trail_steps)
             if should_exit:
-                pnl          = _calc_pnl(stock, ltp)
-                stock.status = "exited"
-                stock.exit_price = ltp
-                stock.pnl        = pnl
+                pnl               = _calc_pnl(stock, ltp)
+                stock.status      = "exited"
+                stock.exit_price  = ltp
+                stock.exit_time   = datetime.now(timezone.utc)
+                stock.exit_reason = reason
+                stock.pnl         = pnl
                 run.total_pnl    = float(run.total_pnl or 0) + pnl
                 _log(run,
                     f"EXIT {stock.symbol} @ ₹{ltp:.2f} [{reason}] "
@@ -483,9 +486,11 @@ async def _force_exit_all(db: Session, token: str, client_id: str):
     for stock in stocks:
         ltp = ltp_map.get(str(stock.security_id), float(stock.entry_price or 0))
         pnl = _calc_pnl(stock, ltp) if stock.status == "entered" else 0
-        stock.status     = "exited"
-        stock.exit_price = ltp
-        stock.pnl        = pnl
+        stock.status      = "exited"
+        stock.exit_price  = ltp
+        stock.exit_time   = datetime.now(timezone.utc)
+        stock.exit_reason = "EOD"
+        stock.pnl         = pnl
         run = db.query(AlgoRun).filter(AlgoRun.id == stock.run_id).first()
         if run:
             run.total_pnl = float(run.total_pnl or 0) + pnl
