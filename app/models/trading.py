@@ -260,6 +260,9 @@ class AlgoStock(Base):
     buy_order_id      = Column(String, nullable=True)
     sell_order_id     = Column(String, nullable=True)
     source            = Column(String, default="preopen")   # preopen | live
+    entry_time        = Column(DateTime(timezone=True), nullable=True)
+    exit_time         = Column(DateTime(timezone=True), nullable=True)
+    exit_reason       = Column(String, nullable=True)       # TARGET | SL | EOD | MANUAL
     created_at        = Column(DateTime(timezone=True), server_default=func.now())
     updated_at        = Column(DateTime(timezone=True), onupdate=func.now())
 
