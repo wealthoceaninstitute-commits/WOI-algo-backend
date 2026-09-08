@@ -8,7 +8,7 @@ from app.core.config import get_settings
 from app.core.database import create_tables, SessionLocal
 from app.core.bootstrap import create_master_if_needed
 from app.routers import auth, clients, credentials, trading, algo
-from app.routers import master_account, universe
+from app.routers import master_account, universe, algo_stats
 from app.services.token_manager import scheduled_morning_refresh
 from app.services.algo_engine import run_daily_algo
 from app.services.scrip_downloader import download_and_update
@@ -113,6 +113,7 @@ app.include_router(trading.router)
 app.include_router(algo.router)
 app.include_router(master_account.router)
 app.include_router(universe.router)
+app.include_router(algo_stats.router)
 
 
 @app.get("/", tags=["health"])
