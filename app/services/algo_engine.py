@@ -25,7 +25,7 @@ from app.core.database import SessionLocal
 from app.models.trading import ClientProfile, AlgoStrategy, AlgoRun, AlgoStock, DailyPnl
 from app.models.scrip_master import UniverseStock, ScripMaster
 from app.services.market_data import (
-    get_master_token, fetch_ltp, fetch_first_candle, fetch_daily_ohlcv,
+    get_master_token, fetch_ltp, fetch_first_candle, fetch_daily_ohlcv, fetch_ohlc_batch,
 )
 
 IST = timezone(timedelta(hours=5, minutes=30))
