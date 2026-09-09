@@ -1,15 +1,6 @@
 """
 app/services/algo_engine.py — WOI Paper Trade Engine
-
-Stock selection flow:
-  08:45 AM → Fetch LTP for entire universe → store as prev_close snapshot
-  09:12:30 → Fetch LTP again → this is the opening/pre-open price
-  09:12:30 → Compute gap% = (open_ltp - prev_close) / prev_close × 100
-  09:12:30 → Apply filters → sort by |gap%| → pick top N
-  09:15:00 → Wait for first 1-min candle (9:15–9:16)
-  09:15:30 → Fetch first candle → compute BUY/SELL triggers
-  09:16:00+ → Monitor loop every 5s → trail SL → exit at target
-  15:20:00 → Force exit all open paper positions
+Verbose logging throughout — every action printed to run log and Railway console.
 """
 
 import asyncio, json
@@ -20,9 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.database import SessionLocal
 from app.models.trading import ClientProfile, AlgoStrategy, AlgoRun, AlgoStock, DailyPnl
 from app.models.scrip_master import UniverseStock, ScripMaster
-from app.services.market_data import (
-    get_master_token, fetch_ltp, fetch_first_candle,
-)
+from app.services.market_data import get_master_token, fetch_ltp, fetch_first_candle
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -32,22 +21,29 @@ FALLBACK_UNIVERSE = [
 ]
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 def _log(run: AlgoRun, msg: str, db: Session):
     ts      = datetime.now(IST).strftime("%H:%M:%S")
-    run.log = (run.log or "") + f"[{ts}] {msg}\n"
+    line    = f"[{ts}] {msg}"
+    run.log = (run.log or "") + line + "\n"
     db.commit()
     print(f"[algo] {msg}")
 
+
+def _log_separator(run: AlgoRun, title: str, db: Session):
+    """Print a section separator in the log."""
+    sep = f"{'─' * 10} {title} {'─' * 10}"
+    _log(run, sep, db)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _subscribed_clients(db: Session) -> list[tuple[ClientProfile, AlgoStrategy]]:
     strategies = db.query(AlgoStrategy).filter(AlgoStrategy.is_active == True).all()
     result = []
     for s in strategies:
-        p = db.query(ClientProfile).filter(
-            ClientProfile.id == s.client_profile_id
-        ).first()
+        p = db.query(ClientProfile).filter(ClientProfile.id == s.client_profile_id).first()
         if p:
             result.append((p, s))
     return result
@@ -73,15 +69,9 @@ def _get_or_create_run(profile_id: str, strategy_id: str, db: Session) -> AlgoRu
     return run
 
 
-# ── Universe loader ───────────────────────────────────────────────────────────
-
 def _load_universe(strategy: AlgoStrategy, db: Session) -> list[dict]:
-    """
-    Load active stocks from the strategy's assigned universe.
-    Returns list of { security_id, symbol, series, lot_size }
-    """
     if not strategy.universe_id:
-        print(f"[algo] No universe set — using fallback list")
+        print("[algo] WARNING: No universe set — using fallback list of 20 stocks")
         rows = db.query(ScripMaster).filter(
             ScripMaster.security_id.in_(FALLBACK_UNIVERSE)
         ).all()
@@ -100,137 +90,118 @@ def _load_universe(strategy: AlgoStrategy, db: Session) -> list[dict]:
     )
 
     if not stocks:
-        print(f"[algo] Universe empty — using fallback")
+        print("[algo] WARNING: Universe empty — using fallback")
         return [{"security_id": sid, "symbol": sid, "series": "EQ", "lot_size": 1}
                 for sid in FALLBACK_UNIVERSE]
 
     result = []
     for s in stocks:
-        scrip = db.query(ScripMaster).filter(
-            ScripMaster.security_id == s.security_id
-        ).first()
+        scrip = db.query(ScripMaster).filter(ScripMaster.security_id == s.security_id).first()
         result.append({
             "security_id": s.security_id,
             "symbol":      s.symbol,
-            "series":      scrip.series    if scrip else "EQ",
-            "lot_size":    scrip.lot_size  if scrip else 1,
+            "series":      scrip.series   if scrip else "EQ",
+            "lot_size":    scrip.lot_size if scrip else 1,
         })
 
-    print(f"[algo] Universe loaded: {len(result)} stocks")
+    print(f"[algo] Universe loaded: {len(result)} active stocks")
     return result
 
-
-# ── Wait until a specific IST time ───────────────────────────────────────────
 
 async def _wait_until(hour: int, minute: int, second: int = 0, label: str = ""):
     now_ist = datetime.now(IST)
     target  = now_ist.replace(hour=hour, minute=minute, second=second, microsecond=0)
     wait    = (target - now_ist).total_seconds()
     if wait > 0:
-        print(f"[algo] Waiting {wait:.0f}s until {hour:02d}:{minute:02d}:{second:02d} IST {label}")
+        print(f"[algo] Waiting {wait:.0f}s until {hour:02d}:{minute:02d}:{second:02d} IST — {label}")
         await asyncio.sleep(wait)
+    else:
+        print(f"[algo] {hour:02d}:{minute:02d}:{second:02d} already past — proceeding immediately")
 
 
 # ── Step 1: 8:45 AM — prev close snapshot ────────────────────────────────────
 
-async def _fetch_prev_close_snapshot(
-    token: str, client_id: str, universe: list[dict]
-) -> dict[str, float]:
-    """
-    Fetch LTP at 8:45 AM for all universe stocks.
-    This becomes the 'previous close' baseline for gap calculation.
-    Returns { security_id: ltp }
-    """
+async def _fetch_prev_close_snapshot(token: str, client_id: str, universe: list[dict]) -> dict[str, float]:
     sec_ids = [u["security_id"] for u in universe]
-    print(f"[algo] 8:45 AM snapshot: fetching LTP for {len(sec_ids)} stocks...")
+    print(f"[algo] Fetching prev close LTP for {len(sec_ids)} stocks in {(len(sec_ids)+899)//900} batch(es)...")
 
     snapshot = {}
-    for i in range(0, len(sec_ids), 900):   # Dhan allows 1000 per request
+    for i in range(0, len(sec_ids), 900):
         batch  = sec_ids[i:i+900]
         prices = await fetch_ltp(token, client_id, batch)
         snapshot.update(prices)
+        print(f"[algo] Batch {i//900 + 1}: got {len(prices)} prices")
         if i + 900 < len(sec_ids):
-            await asyncio.sleep(1.1)         # 1 req/sec rate limit
+            await asyncio.sleep(1.1)
 
-    valid = {k: v for k, v in snapshot.items() if v and v > 0}
-    print(f"[algo] 8:45 AM snapshot: {len(valid)} stocks with valid LTP")
+    valid   = {k: v for k, v in snapshot.items() if v and v > 0}
+    invalid = len(sec_ids) - len(valid)
+    print(f"[algo] Prev close snapshot complete: {len(valid)} valid, {invalid} zero/missing")
     return valid
 
 
-# ── Step 2: 9:12:30 — opening price scan + gap calculation ───────────────────
+# ── Step 2: 9:12:30 — opening price scan ─────────────────────────────────────
 
-async def _fetch_opening_prices(
-    token: str, client_id: str, universe: list[dict]
-) -> dict[str, float]:
-    """
-    Fetch LTP at 9:12:30 AM — this is the pre-open discovered price
-    (indicative opening price before actual market open at 9:15).
-    Returns { security_id: ltp }
-    """
+async def _fetch_opening_prices(token: str, client_id: str, universe: list[dict]) -> dict[str, float]:
     sec_ids = [u["security_id"] for u in universe]
-    print(f"[algo] 9:12:30 scan: fetching opening LTP for {len(sec_ids)} stocks...")
+    print(f"[algo] Fetching opening LTP for {len(sec_ids)} stocks...")
 
     opening = {}
     for i in range(0, len(sec_ids), 900):
         batch  = sec_ids[i:i+900]
         prices = await fetch_ltp(token, client_id, batch)
         opening.update(prices)
+        print(f"[algo] Batch {i//900 + 1}: got {len(prices)} prices")
         if i + 900 < len(sec_ids):
             await asyncio.sleep(1.1)
 
     valid = {k: v for k, v in opening.items() if v and v > 0}
-    print(f"[algo] 9:12:30 scan: {len(valid)} stocks with valid price")
+    print(f"[algo] Opening prices complete: {len(valid)} valid")
     return valid
 
 
-def _compute_gaps(
-    prev_close: dict[str, float],
-    opening:    dict[str, float],
-    universe:   list[dict],
-) -> dict[str, dict]:
-    """
-    gap% = (opening_ltp - prev_close_ltp) / prev_close_ltp × 100
-    Returns { security_id: { symbol, gap_pct, prev_close, open_price, series, lot_size } }
-    """
+def _compute_gaps(prev_close: dict, opening: dict, universe: list[dict]) -> dict:
     meta    = {u["security_id"]: u for u in universe}
     results = {}
+    zero_gap = 0
+    no_prev  = 0
 
     for sid, open_price in opening.items():
         prev = prev_close.get(sid)
         if not prev or prev <= 0 or open_price <= 0:
+            no_prev += 1
             continue
         gap_pct = ((open_price - prev) / prev) * 100
-        m       = meta.get(sid, {})
+        if gap_pct == 0:
+            zero_gap += 1
+        m = meta.get(sid, {})
         results[sid] = {
-            "symbol":      m.get("symbol", sid),
-            "series":      m.get("series", "EQ"),
-            "lot_size":    m.get("lot_size", 1),
-            "gap_pct":     round(gap_pct, 2),
-            "prev_close":  round(prev, 2),
-            "open_price":  round(open_price, 2),
+            "symbol":     m.get("symbol", sid),
+            "series":     m.get("series", "EQ"),
+            "lot_size":   m.get("lot_size", 1),
+            "gap_pct":    round(gap_pct, 2),
+            "prev_close": round(prev, 2),
+            "open_price": round(open_price, 2),
         }
+
+    print(f"[algo] Gap calculation: {len(results)} stocks computed | {zero_gap} zero-gap | {no_prev} missing prev close")
+
+    # Show distribution
+    gap_bands = {"0-1%": 0, "1-3%": 0, "3-8%": 0, "8%+": 0}
+    for d in results.values():
+        g = abs(d["gap_pct"])
+        if g < 1: gap_bands["0-1%"] += 1
+        elif g < 3: gap_bands["1-3%"] += 1
+        elif g < 8: gap_bands["3-8%"] += 1
+        else: gap_bands["8%+"] += 1
+    print(f"[algo] Gap distribution: {gap_bands}")
 
     return results
 
 
-# ── Step 3: Apply filters & select top N ─────────────────────────────────────
+# ── Step 3: Apply filters ─────────────────────────────────────────────────────
 
-def _apply_filters(
-    gap_results: dict,
-    strategy:    AlgoStrategy,
-    run:         AlgoRun,
-    db:          Session,
-) -> list[dict]:
-    """
-    Filter sequence:
-      1. Gap % band
-      2. Min price (prev_close ≥ min_price)
-      3. Max price (prev_close ≤ max_price, if set)
-      4. BE series exclusion
-      5. Sort by |gap%| descending
-      6. Take top max_stocks_per_day
-    Note: volume/turnover not available from LTP — skipped in this flow.
-    """
+def _apply_filters(gap_results: dict, strategy: AlgoStrategy, run: AlgoRun, db: Session) -> list[dict]:
     gap_min   = float(strategy.gap_min)
     gap_max   = float(strategy.gap_max)
     min_price = float(strategy.min_price or 0)
@@ -238,62 +209,68 @@ def _apply_filters(
     excl_be   = bool(strategy.exclude_be_series)
     max_n     = int(strategy.max_stocks_per_day)
 
+    _log_separator(run, "STOCK SELECTION", db)
+    _log(run, f"Universe: {len(gap_results)} stocks with gap data", db)
+    _log(run, f"Filters: gap={gap_min}–{gap_max}% | min_price=₹{min_price} | max_price=₹{max_price} | excl_BE={excl_be}", db)
+
     passed   = []
-    rejected = {"gap": 0, "price": 0, "be": 0}
+    rej_gap  = []
+    rej_price= []
+    rej_be   = []
 
     for sid, d in gap_results.items():
         gap  = abs(d["gap_pct"])
         prev = d["prev_close"]
         ser  = d.get("series", "EQ")
+        sym  = d.get("symbol", sid)
 
-        # 1. Gap band
         if not (gap_min <= gap <= gap_max):
-            rejected["gap"] += 1
+            rej_gap.append(f"{sym}({d['gap_pct']:+.1f}%)")
             continue
-
-        # 2. Min price filter (0 = disabled)
         if min_price > 0 and prev < min_price:
-            rejected["price"] += 1
+            rej_price.append(f"{sym}(₹{prev})")
             continue
-
-        # 3. Max price filter (0 = disabled)
         if max_price > 0 and prev > max_price:
-            rejected["price"] += 1
+            rej_price.append(f"{sym}(₹{prev})")
             continue
-
-        # 4. BE series exclusion
         if excl_be and ser == "BE":
-            rejected["be"] += 1
+            rej_be.append(sym)
             continue
 
         passed.append({"security_id": sid, **d})
 
-    _log(run,
-        f"Filters: {len(gap_results)} stocks scanned | "
-        f"gap={rejected['gap']} rejected | price={rejected['price']} rejected | "
-        f"BE={rejected['be']} excluded | {len(passed)} qualify",
-        db)
+    _log(run, f"Rejected by gap filter: {len(rej_gap)} stocks", db)
+    _log(run, f"Rejected by price filter: {len(rej_price)} stocks", db)
+    if excl_be:
+        _log(run, f"Rejected BE series: {len(rej_be)} stocks", db)
+    _log(run, f"Passed all filters: {len(passed)} stocks qualify", db)
 
-    # Sort by absolute gap% descending — biggest movers first
+    if len(passed) == 0:
+        _log(run, "WARNING: No stocks passed filters! Check gap% settings vs today's market.", db)
+        # Log top gappers for debugging
+        top = sorted(gap_results.values(), key=lambda x: abs(x["gap_pct"]), reverse=True)[:10]
+        _log(run, f"Top 10 gap movers today (for reference):", db)
+        for s in top:
+            _log(run, f"  {s['symbol']}: {s['gap_pct']:+.2f}% | prev=₹{s['prev_close']}", db)
+        return []
+
+    # Sort by absolute gap% descending
     passed.sort(key=lambda x: abs(x["gap_pct"]), reverse=True)
     selected = passed[:max_n]
 
-    _log(run,
-        f"Selected top {len(selected)}: " +
-        ", ".join(f"{s['symbol']} ({s['gap_pct']:+.2f}%)" for s in selected),
-        db)
+    _log(run, f"Selected top {len(selected)} of {len(passed)} qualifying stocks:", db)
+    for s in selected:
+        _log(run,
+            f"  {s['symbol']}: gap={s['gap_pct']:+.2f}% | "
+            f"prev=₹{s['prev_close']} | open=₹{s['open_price']} | series={s['series']}",
+            db)
 
     return selected
 
 
-# ── Step 4: First candle entry triggers ──────────────────────────────────────
+# ── Step 4: First candle ──────────────────────────────────────────────────────
 
-async def _compute_entry(
-    security_id: str,
-    strategy:    AlgoStrategy,
-    token:       str,
-    client_id:   str,
-) -> Optional[dict]:
+async def _compute_entry(security_id: str, strategy: AlgoStrategy, token: str, client_id: str) -> Optional[dict]:
     candle = await fetch_first_candle(token, client_id, security_id)
     if not candle:
         return None
@@ -307,11 +284,11 @@ async def _compute_entry(
 
     buy_trigger  = round(base_buy  * (1 + buf), 2)
     sell_trigger = round(base_sell * (1 - buf), 2)
-
-    risk_per_share = buy_trigger * sl
-    quantity = max(1, int(risk / risk_per_share)) if risk_per_share > 0 else 1
+    rps          = buy_trigger * sl
+    quantity     = max(1, int(risk / rps)) if rps > 0 else 1
 
     return {
+        "candle_open":  candle["open"],
         "candle_high":  candle["high"],
         "candle_low":   candle["low"],
         "candle_close": candle["close"],
@@ -321,14 +298,9 @@ async def _compute_entry(
     }
 
 
-# ── Trail SL & exit ───────────────────────────────────────────────────────────
+# ── Trail SL ──────────────────────────────────────────────────────────────────
 
-def _check_exit(
-    stock:       AlgoStock,
-    ltp:         float,
-    strategy:    AlgoStrategy,
-    trail_steps: list,
-) -> tuple[bool, str]:
+def _check_exit(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_steps: list) -> tuple[bool, str]:
     entry  = float(stock.entry_price or 0)
     one_r  = entry * float(strategy.sl_pct)
     target = float(strategy.target_r)
@@ -364,16 +336,14 @@ def _calc_pnl(stock: AlgoStock, exit_price: float) -> float:
     entry = float(stock.entry_price or 0)
     return round(
         (exit_price - entry) * qty if stock.entry_direction == "BUY"
-        else (entry - exit_price) * qty,
-        2,
+        else (entry - exit_price) * qty, 2
     )
 
 
 def _update_daily_pnl(profile_id: str, pnl: float, db: Session):
     today = date.today()
     row   = db.query(DailyPnl).filter(
-        DailyPnl.client_profile_id == profile_id,
-        DailyPnl.date              == today,
+        DailyPnl.client_profile_id == profile_id, DailyPnl.date == today
     ).first()
     if row:
         row.closed_pnl  = float(row.closed_pnl  or 0) + pnl
@@ -391,9 +361,7 @@ def _update_daily_pnl(profile_id: str, pnl: float, db: Session):
 
 async def _monitor_tick(db: Session, token: str, client_id: str):
     today  = date.today()
-    stocks = db.query(AlgoStock).filter(
-        AlgoStock.status.in_(["watching", "entered"])
-    ).all()
+    stocks = db.query(AlgoStock).filter(AlgoStock.status.in_(["watching", "entered"])).all()
     if not stocks:
         return
 
@@ -420,20 +388,17 @@ async def _monitor_tick(db: Session, token: str, client_id: str):
         except Exception:
             trail_steps = []
 
-        # Watching → check if trigger hit
         if stock.status == "watching":
             buy_t  = float(stock.buy_trigger  or 0)
             sell_t = float(stock.sell_trigger or 0)
-
             entered = False
+
             if not strategy.gap_direction_bias:
-                # OCO — either side triggers
                 if buy_t and ltp >= buy_t:
                     stock.entry_direction = "BUY";  entered = True
                 elif sell_t and ltp <= sell_t:
                     stock.entry_direction = "SELL"; entered = True
             else:
-                # Only enter in gap direction
                 if stock.direction == "UP"   and buy_t  and ltp >= buy_t:
                     stock.entry_direction = "BUY";  entered = True
                 elif stock.direction == "DOWN" and sell_t and ltp <= sell_t:
@@ -444,39 +409,45 @@ async def _monitor_tick(db: Session, token: str, client_id: str):
                 stock.entry_price = ltp
                 stock.entry_time  = datetime.now(timezone.utc)
                 run.stocks_traded = (run.stocks_traded or 0) + 1
+                trig = buy_t if stock.entry_direction == "BUY" else sell_t
+                sl_price = ltp * (1 - float(strategy.sl_pct)) if stock.entry_direction == "BUY" \
+                           else ltp * (1 + float(strategy.sl_pct))
+                tgt_price = ltp * (1 + float(strategy.sl_pct) * float(strategy.target_r)) \
+                            if stock.entry_direction == "BUY" \
+                            else ltp * (1 - float(strategy.sl_pct) * float(strategy.target_r))
                 _log(run,
                     f"PAPER {stock.entry_direction} {stock.symbol} @ ₹{ltp:.2f} "
-                    f"(trigger ₹{buy_t if stock.entry_direction == 'BUY' else sell_t:.2f})",
+                    f"| trigger=₹{trig:.2f} | SL=₹{sl_price:.2f} | target=₹{tgt_price:.2f} "
+                    f"| qty={stock.quantity}",
                     db)
-
             db.commit()
             continue
 
-        # Entered → check trail SL / target exit
         if stock.status == "entered" and stock.entry_price and stock.entry_direction:
             should_exit, reason = _check_exit(stock, ltp, strategy, trail_steps)
             if should_exit:
                 pnl               = _calc_pnl(stock, ltp)
+                entry             = float(stock.entry_price)
+                one_r             = entry * float(strategy.sl_pct)
+                rr                = round(pnl / (one_r * (stock.quantity or 1)), 2) if one_r > 0 else 0
                 stock.status      = "exited"
                 stock.exit_price  = ltp
                 stock.exit_time   = datetime.now(timezone.utc)
                 stock.exit_reason = reason
                 stock.pnl         = pnl
-                run.total_pnl    = float(run.total_pnl or 0) + pnl
+                run.total_pnl     = float(run.total_pnl or 0) + pnl
                 _log(run,
-                    f"EXIT {stock.symbol} @ ₹{ltp:.2f} [{reason}] "
-                    f"P&L: {pnl:+.2f}",
+                    f"EXIT {stock.symbol} [{reason}] @ ₹{ltp:.2f} "
+                    f"| entry=₹{entry:.2f} | P&L=₹{pnl:+.2f} | R:R={rr:+.2f}R",
                     db)
                 _update_daily_pnl(stock.client_profile_id, pnl, db)
-
         db.commit()
 
 
 # ── EOD force exit ────────────────────────────────────────────────────────────
 
 async def _force_exit_all(db: Session, token: str, client_id: str):
-    print("[algo] 3:20 PM — force-exiting all open paper positions")
-    stocks  = db.query(AlgoStock).filter(AlgoStock.status.in_(["watching","entered"])).all()
+    stocks  = db.query(AlgoStock).filter(AlgoStock.status.in_(["watching", "entered"])).all()
     if not stocks:
         return
 
@@ -494,32 +465,36 @@ async def _force_exit_all(db: Session, token: str, client_id: str):
         run = db.query(AlgoRun).filter(AlgoRun.id == stock.run_id).first()
         if run:
             run.total_pnl = float(run.total_pnl or 0) + pnl
-            _log(run, f"FORCE EXIT {stock.symbol} @ ₹{ltp:.2f} [EOD] P&L: {pnl:+.2f}", db)
+            _log(run, f"FORCE EXIT {stock.symbol} @ ₹{ltp:.2f} [EOD] | P&L=₹{pnl:+.2f}", db)
         if pnl != 0:
             _update_daily_pnl(stock.client_profile_id, pnl, db)
 
     db.commit()
-    print(f"[algo] Force-exited {len(stocks)} positions")
 
 
 # ── Main daily run ────────────────────────────────────────────────────────────
 
 async def run_daily_algo():
-    """
-    Full daily paper trading cycle.
-    Scheduled at 8:45 AM IST by morning_scheduler in main.py.
-    """
     db = SessionLocal()
     try:
+        now_ist = datetime.now(IST)
+        print(f"[algo] ═══════════════════════════════════════")
+        print(f"[algo] WOI Algo Engine starting — {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
+        print(f"[algo] ═══════════════════════════════════════")
+
         clients = _subscribed_clients(db)
         if not clients:
-            print("[algo] No subscribed clients — skipping")
+            print("[algo] No subscribed clients — nothing to do")
             return
 
-        print(f"[algo] Starting daily run for {len(clients)} client(s)")
-        token, master_client_id = await get_master_token(db)
+        print(f"[algo] Subscribed clients: {len(clients)}")
 
-        # Create today's run records
+        # Get master token
+        print("[algo] Getting master data account token...")
+        token, master_client_id = await get_master_token(db)
+        print(f"[algo] Master token OK (client_id: {master_client_id})")
+
+        # Create runs
         runs = {}
         for profile, strategy in clients:
             run = _get_or_create_run(profile.id, strategy.id, db)
@@ -527,73 +502,111 @@ async def run_daily_algo():
             run.started_at = datetime.now(timezone.utc)
             db.commit()
             runs[profile.id] = (run, strategy)
+            _log(run, f"═══ WOI Algo run started — {now_ist.strftime('%Y-%m-%d')} ═══", db)
+            _log(run, f"Strategy: {strategy.name} | Gap: {strategy.gap_min}–{strategy.gap_max}% | "
+                      f"Risk: ₹{strategy.risk_per_trade} | Target: 1:{strategy.target_r}R | "
+                      f"Max stocks: {strategy.max_stocks_per_day}", db)
 
-        # Load all universes — scan union of all to minimise API calls
+        # Load universes
         client_universes = {}
-        all_meta         = {}   # security_id → { symbol, series, lot_size }
+        all_meta = {}
         for profile, strategy in clients:
             universe = _load_universe(strategy, db)
             client_universes[profile.id] = universe
             for u in universe:
                 all_meta[u["security_id"]] = u
+            run, _ = runs[profile.id]
+            _log(run, f"Universe loaded: {len(universe)} active stocks", db)
 
         combined_universe = list(all_meta.values())
-        print(f"[algo] Combined universe: {len(combined_universe)} unique stocks")
+        print(f"[algo] Combined universe: {len(combined_universe)} unique stocks across all clients")
 
-        # ── STEP 1: 8:45 AM — prev close snapshot ──────────────────────
-        await _wait_until(8, 45, 0, "(prev close snapshot)")
-        token, master_client_id = await get_master_token(db)
-        prev_close_snap = await _fetch_prev_close_snapshot(
-            token, master_client_id, combined_universe
-        )
+        # ── STEP 1: 8:45 AM prev close ─────────────────────────────────
         for _, (run, _) in runs.items():
-            _log(run, f"8:45 AM snapshot: {len(prev_close_snap)} stocks captured", db)
+            _log_separator(run, "STEP 1: PREV CLOSE SNAPSHOT (8:45 AM)", db)
 
-        # ── STEP 2: 9:12:30 — opening price scan ───────────────────────
-        await _wait_until(9, 12, 30, "(opening price scan)")
+        wait_845 = _wait_until(8, 45, 0, "prev close snapshot")
+        for _, (run, _) in runs.items():
+            _log(run, f"Waiting for 8:45 AM to fetch prev close LTP...", db)
+        await wait_845
+
         token, master_client_id = await get_master_token(db)
-        opening_prices = await _fetch_opening_prices(
-            token, master_client_id, combined_universe
-        )
+        for _, (run, _) in runs.items():
+            _log(run, f"Fetching LTP for {len(combined_universe)} stocks as prev close baseline...", db)
 
-        # Compute gaps for full universe
-        all_gaps = _compute_gaps(prev_close_snap, opening_prices, combined_universe)
-        print(f"[algo] Gap computed for {len(all_gaps)} stocks")
+        prev_close_snap = await _fetch_prev_close_snapshot(token, master_client_id, combined_universe)
 
-        # ── STEP 3: Apply per-client filters → select top N ────────────
+        for _, (run, _) in runs.items():
+            _log(run, f"Prev close snapshot: {len(prev_close_snap)}/{len(combined_universe)} stocks captured", db)
+            if len(prev_close_snap) < len(combined_universe) * 0.9:
+                _log(run, f"WARNING: Only {len(prev_close_snap)} of {len(combined_universe)} stocks returned LTP — check master data account", db)
+
+        # ── STEP 2: 9:12:30 opening scan ───────────────────────────────
+        for _, (run, _) in runs.items():
+            _log_separator(run, "STEP 2: OPENING PRICE SCAN (9:12:30)", db)
+            _log(run, "Waiting for 9:12:30 to fetch pre-open prices...", db)
+
+        await _wait_until(9, 12, 30, "opening price scan")
+        token, master_client_id = await get_master_token(db)
+
+        for _, (run, _) in runs.items():
+            _log(run, f"Fetching opening LTP for {len(combined_universe)} stocks...", db)
+
+        opening_prices = await _fetch_opening_prices(token, master_client_id, combined_universe)
+        all_gaps       = _compute_gaps(prev_close_snap, opening_prices, combined_universe)
+
+        for _, (run, _) in runs.items():
+            _log(run, f"Opening prices: {len(opening_prices)} stocks fetched", db)
+            _log(run, f"Gap computed for {len(all_gaps)} stocks", db)
+
+            # Gap distribution in log
+            bands = {"0–1%": 0, "1–3%": 0, "3–8%": 0, "8%+": 0}
+            for d in all_gaps.values():
+                g = abs(d["gap_pct"])
+                if g < 1: bands["0–1%"] += 1
+                elif g < 3: bands["1–3%"] += 1
+                elif g < 8: bands["3–8%"] += 1
+                else: bands["8%+"] += 1
+            _log(run, f"Gap distribution: {bands}", db)
+
+        # ── STEP 3: Filter & select ─────────────────────────────────────
         for profile, strategy in clients:
             run, strat = runs[profile.id]
-
-            # Filter gap_results to this client's universe only
             client_sids = {u["security_id"] for u in client_universes[profile.id]}
             client_gaps = {sid: d for sid, d in all_gaps.items() if sid in client_sids}
-
             run.stocks_scanned = len(client_sids)
             selected = _apply_filters(client_gaps, strat, run, db)
             run.stocks_selected = len(selected)
             db.commit()
 
-            for item in selected:
-                exists = db.query(AlgoStock).filter(
-                    AlgoStock.run_id      == run.id,
-                    AlgoStock.security_id == item["security_id"],
-                ).first()
-                if not exists:
-                    db.add(AlgoStock(
-                        run_id            = run.id,
-                        client_profile_id = profile.id,
-                        symbol            = item["symbol"],
-                        security_id       = item["security_id"],
-                        gap_pct           = item["gap_pct"],
-                        direction         = "UP" if item["gap_pct"] > 0 else "DOWN",
-                        prev_close        = item["prev_close"],
-                        status            = "watching",
-                        source            = "preopen",
-                    ))
-            db.commit()
+            if not selected:
+                _log(run, "No stocks selected — algo will idle until 3:20 PM then exit", db)
+            else:
+                for item in selected:
+                    exists = db.query(AlgoStock).filter(
+                        AlgoStock.run_id == run.id,
+                        AlgoStock.security_id == item["security_id"],
+                    ).first()
+                    if not exists:
+                        db.add(AlgoStock(
+                            run_id=run.id,
+                            client_profile_id=profile.id,
+                            symbol=item["symbol"],
+                            security_id=item["security_id"],
+                            gap_pct=item["gap_pct"],
+                            direction="UP" if item["gap_pct"] > 0 else "DOWN",
+                            prev_close=item["prev_close"],
+                            status="watching",
+                            source="preopen",
+                        ))
+                db.commit()
 
-        # ── STEP 4: 9:16:05 — first 1-min candle (candle closes at 9:16:00) ──
-        await _wait_until(9, 16, 5, "(first candle — 5s after 9:16:00 close)")
+        # ── STEP 4: 9:16:05 first candle ───────────────────────────────
+        for _, (run, _) in runs.items():
+            _log_separator(run, "STEP 3: FIRST CANDLE (9:16:05)", db)
+            _log(run, "Waiting for 9:16:05 — first 1-min candle closes at 9:16:00...", db)
+
+        await _wait_until(9, 16, 5, "first candle")
         token, master_client_id = await get_master_token(db)
 
         for profile, strategy in clients:
@@ -602,14 +615,18 @@ async def run_daily_algo():
             db.commit()
 
             stocks = db.query(AlgoStock).filter(
-                AlgoStock.run_id == run.id,
-                AlgoStock.status == "watching",
+                AlgoStock.run_id == run.id, AlgoStock.status == "watching"
             ).all()
 
+            if not stocks:
+                _log(run, "No stocks to fetch candle for (none selected in previous step)", db)
+                continue
+
+            _log(run, f"Fetching first 1-min candle for {len(stocks)} selected stocks...", db)
+
             for stock in stocks:
-                entry = await _compute_entry(
-                    stock.security_id, strat, token, master_client_id
-                )
+                _log(run, f"Fetching candle for {stock.symbol} (security_id={stock.security_id})...", db)
+                entry = await _compute_entry(stock.security_id, strat, token, master_client_id)
                 if entry:
                     stock.candle_high   = entry["candle_high"]
                     stock.candle_low    = entry["candle_low"]
@@ -618,52 +635,93 @@ async def run_daily_algo():
                     stock.sell_trigger  = entry["sell_trigger"]
                     stock.quantity      = entry["quantity"]
                     _log(run,
-                        f"{stock.symbol}: candle close ₹{entry['candle_close']:.2f} | "
-                        f"BUY trigger ₹{entry['buy_trigger']:.2f} | "
-                        f"SELL trigger ₹{entry['sell_trigger']:.2f} | "
-                        f"Qty {entry['quantity']}",
+                        f"{stock.symbol}: O=₹{entry['candle_open']:.2f} "
+                        f"H=₹{entry['candle_high']:.2f} "
+                        f"L=₹{entry['candle_low']:.2f} "
+                        f"C=₹{entry['candle_close']:.2f} | "
+                        f"BUY trigger=₹{entry['buy_trigger']:.2f} | "
+                        f"SELL trigger=₹{entry['sell_trigger']:.2f} | "
+                        f"Qty={entry['quantity']}",
                         db)
                 else:
                     stock.status = "cancelled"
-                    _log(run, f"{stock.symbol}: No candle data yet — skipped", db)
+                    _log(run, f"{stock.symbol}: No candle data returned from Dhan — skipped", db)
                 db.commit()
                 await asyncio.sleep(0.3)
 
-        # ── STEP 5: Monitor loop until 3:20 PM ─────────────────────────
-        eod_ist = datetime.now(IST).replace(hour=15, minute=20, second=0, microsecond=0)
-        print("[algo] Monitor loop started (every 5s)")
+        # ── STEP 5: Monitor loop ────────────────────────────────────────
+        for _, (run, _) in runs.items():
+            _log_separator(run, "STEP 4: MONITORING", db)
+            _log(run, "Monitor loop started — checking LTP every 5s until 3:20 PM", db)
+
+        eod_ist    = datetime.now(IST).replace(hour=15, minute=20, second=0, microsecond=0)
+        tick_count = 0
 
         while datetime.now(IST) < eod_ist:
             await asyncio.sleep(5)
+            tick_count += 1
             try:
                 token, master_client_id = await get_master_token(db)
                 await _monitor_tick(db, token, master_client_id)
             except Exception as e:
                 print(f"[algo] Monitor tick error: {e}")
+                for _, (run, _) in runs.items():
+                    _log(run, f"Monitor tick error: {e}", db)
 
-            # Stop early if all positions closed
+            # Log heartbeat every 60 ticks (~5 min)
+            if tick_count % 60 == 0:
+                elapsed = (datetime.now(IST) - now_ist).seconds // 60
+                open_count = db.query(AlgoStock).filter(
+                    AlgoStock.status.in_(["watching", "entered"])
+                ).count()
+                for _, (run, _) in runs.items():
+                    _log(run, f"Heartbeat: {elapsed}min elapsed | {open_count} position(s) still open", db)
+
             open_count = db.query(AlgoStock).filter(
                 AlgoStock.status.in_(["watching", "entered"])
             ).count()
             if open_count == 0:
-                print("[algo] All positions closed — stopping monitor loop")
+                for _, (run, _) in runs.items():
+                    _log(run, "All positions closed — stopping monitor loop early", db)
                 break
 
-        # ── STEP 6: 3:20 PM EOD force exit ─────────────────────────────
+        # ── STEP 6: EOD force exit ──────────────────────────────────────
+        for _, (run, _) in runs.items():
+            _log_separator(run, "STEP 5: EOD FORCE EXIT (3:20 PM)", db)
+
         token, master_client_id = await get_master_token(db)
         await _force_exit_all(db, token, master_client_id)
 
-        # Mark all runs done
+        # Final summary
         for profile, _ in clients:
             run, _ = runs[profile.id]
             run.status      = "done"
             run.finished_at = datetime.now(timezone.utc)
-            _log(run, f"Run complete. Total P&L: ₹{float(run.total_pnl or 0):.2f}", db)
+            _log_separator(run, "RUN COMPLETE", db)
+            _log(run, f"Total P&L: ₹{float(run.total_pnl or 0):.2f}", db)
+            _log(run, f"Stocks: scanned={run.stocks_scanned} | selected={run.stocks_selected} | traded={run.stocks_traded}", db)
+            winners = db.query(AlgoStock).filter(
+                AlgoStock.run_id == run.id, AlgoStock.status == "exited",
+                AlgoStock.pnl > 0
+            ).count()
+            losers = db.query(AlgoStock).filter(
+                AlgoStock.run_id == run.id, AlgoStock.status == "exited",
+                AlgoStock.pnl <= 0
+            ).count()
+            _log(run, f"Trades: {winners} winners | {losers} losers | "
+                      f"Win rate: {round(winners/(winners+losers)*100,1) if (winners+losers) > 0 else 0}%", db)
 
-        print("[algo] Daily run complete")
+        print("[algo] ═══ Daily run complete ═══")
 
     except Exception as e:
-        print(f"[algo] Fatal error: {e}")
+        print(f"[algo] FATAL ERROR: {e}")
         import traceback; traceback.print_exc()
+        for _, (run, _) in runs.items() if 'runs' in dir() else []:
+            try:
+                _log(run, f"FATAL ERROR: {e}", db)
+                run.status = "error"
+                db.commit()
+            except Exception:
+                pass
     finally:
         db.close()
