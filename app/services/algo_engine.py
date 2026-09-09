@@ -132,24 +132,31 @@ async def _fetch_gap_data(
     token: str,
     client_id: str,
     universe: list[dict],
+    pre_open_snap: dict,
     run: AlgoRun,
     db: Session,
 ) -> dict:
     """
-    Fetch daily OHLCV for yesterday + today for each stock.
-    yesterday close → prev_close
-    today open      → opening price
-    yesterday volume → for volume filter
+    Hybrid approach:
+    - Yesterday close: from Daily Historical API (accurate, finalized)
+    - Today open:      from LTP at 9:12:30 AM pre-open (live indicative price)
+    - Volume:          from yesterday's historical candle (for volume filter)
     gap% = (today_open - yesterday_close) / yesterday_close × 100
 
     Returns { security_id: { symbol, gap_pct, prev_close, open_price, volume, series } }
     """
-    today_str     = date.today().strftime("%Y-%m-%d")
-    # Get last 3 trading days to ensure we have yesterday even with weekends
-    from_date_str = (date.today() - timedelta(days=5)).strftime("%Y-%m-%d")
+    today         = date.today()
+    yesterday     = today - timedelta(days=1)
+    # Use yesterday as toDate — avoids partial today candle issue
+    # fromDate = 7 days back to cover weekends/holidays
+    today_str     = today.strftime("%Y-%m-%d")
+    yesterday_str = yesterday.strftime("%Y-%m-%d")
+    from_date_str = (today - timedelta(days=7)).strftime("%Y-%m-%d")
 
     _sep(run, "GAP CALCULATION — DAILY HISTORICAL DATA", db)
-    _log(run, f"Fetching daily OHLCV: fromDate={from_date_str} toDate={today_str}", db)
+    _log(run, f"Fetching daily OHLCV: fromDate={from_date_str} toDate={yesterday_str}", db)
+    _log(run, f"  yesterday close = prev_close for gap calc", db)
+    _log(run, f"  today open = fetched via LTP at 9:12:30 AM (pre-open price)", db)
     _log(run, f"Stocks to fetch: {len(universe)}", db)
 
     results   = {}
@@ -164,29 +171,33 @@ async def _fetch_gap_data(
         series = u.get("series", "EQ")
 
         try:
+            # Fetch historical up to yesterday — avoids partial today candle
             candles = await fetch_daily_ohlcv(
                 token, client_id, sid,
                 from_date=from_date_str,
-                to_date=today_str,
+                to_date=yesterday_str,
             )
 
-            if len(candles) < 2:
+            if not candles:
                 no_yest += 1
                 continue
 
-            # Last candle = today, second-to-last = yesterday
-            today_candle = candles[-1]
-            yest_candle  = candles[-2]
+            # Last candle = yesterday's actual close
+            yest_candle = candles[-1]
+            yest_close  = float(yest_candle["close"]  or 0)
+            yest_volume = int(yest_candle["volume"]   or 0)
 
-            today_open   = float(today_candle["open"]  or 0)
-            yest_close   = float(yest_candle["close"]  or 0)
-            yest_volume  = int(yest_candle["volume"]   or 0)
+            if yest_close <= 0:
+                no_yest += 1
+                continue
 
-            if today_open <= 0 or yest_close <= 0:
+            # today_open comes from pre_close_snap (LTP at 9:12:30 pre-open)
+            today_open = pre_open_snap.get(sid, 0)
+            if today_open <= 0:
                 no_today += 1
                 continue
 
-            gap_pct = ((today_open - yest_close) / yest_close) * 100
+            gap_pct     = ((today_open - yest_close) / yest_close) * 100
             turnover_cr = round((yest_close * yest_volume) / 1e7, 2)
 
             results[sid] = {
@@ -562,10 +573,26 @@ async def run_daily_algo():
             run, strat = runs[profile.id]
             universe   = client_universes[profile.id]
 
-            _log(run, f"Fetching daily historical OHLCV for {len(universe)} stocks "
+            _sep(run, "STEP 1: PRE-OPEN PRICE SCAN (9:12:30)", db)
+            _log(run, f"Fetching pre-open LTP for {len(universe)} stocks (today's opening price)...", db)
+
+            # Fetch today's pre-open prices via LTP
+            pre_open_snap = {}
+            sec_ids = [u["security_id"] for u in universe]
+            for i in range(0, len(sec_ids), 900):
+                batch  = sec_ids[i:i+900]
+                prices = await fetch_ltp(token, master_client_id, batch)
+                pre_open_snap.update(prices)
+                if i + 900 < len(sec_ids):
+                    await asyncio.sleep(1.1)
+            valid_ltp = sum(1 for v in pre_open_snap.values() if v > 0)
+            _log(run, f"Pre-open LTP: {valid_ltp}/{len(universe)} stocks with price", db)
+
+            _sep(run, "STEP 2: YESTERDAY CLOSE — DAILY HISTORICAL", db)
+            _log(run, f"Fetching yesterday's close for {len(universe)} stocks "
                       f"(1 req/stock @ 1 req/sec — takes ~{len(universe)}s)", db)
 
-            gap_results = await _fetch_gap_data(token, master_client_id, universe, run, db)
+            gap_results = await _fetch_gap_data(token, master_client_id, universe, pre_open_snap, run, db)
 
             run.stocks_scanned = len(universe)
             selected = _apply_filters(gap_results, strat, run, db)
