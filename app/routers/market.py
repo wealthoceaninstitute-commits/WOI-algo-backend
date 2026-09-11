@@ -142,12 +142,21 @@ async def save_snapshot(
     today = date.today()
 
     if payload.type == "prev_close":
+        # Build symbol lookup from UniverseStock + ScripMaster
+        from app.models.scrip_master import ScripMaster
+        scrip_map = {
+            str(r.security_id): r.symbol
+            for r in db.query(ScripMaster).filter(
+                ScripMaster.security_id.in_(list(valid.keys()))
+            ).all()
+        }
+
         # Upsert prev_close rows
         rows_to_insert = [
             {
                 "trade_date":  today,
                 "security_id": sid,
-                "symbol":      sid,
+                "symbol":      scrip_map.get(str(sid), sid),
                 "prev_close":  price,
                 "open_price":  None,
                 "gap_pct":     None,
