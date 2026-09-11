@@ -74,11 +74,16 @@ async def get_ltp(
             "has_snapshot": prev is not None,
         }
 
+    # Flatten to { sid: {ltp, prev_close} } — simpler for frontend
+    flat = {
+        sid: {"ltp": v["ltp"], "prev_close": v["prev_close"]}
+        for sid, v in result.items()
+    }
     return {
-        "fetched":    len([v for v in result.values() if v["ltp"]]),
-        "total":      len(payload.security_ids),
-        "exchange":   payload.exchange,
-        "data":       result,
+        "fetched":  len([v for v in flat.values() if v["ltp"]]),
+        "total":    len(payload.security_ids),
+        "exchange": payload.exchange,
+        "data":     flat,
     }
 
 
@@ -111,14 +116,18 @@ async def save_snapshot(
 
     # Get security_ids — from payload or full universe
     if payload.security_ids:
+        # Use provided IDs directly (e.g. from watchlist)
         sec_ids = payload.security_ids
     else:
+        # Load full active universe
         rows = db.query(UniverseStock).filter(
             UniverseStock.is_active   == True,
             UniverseStock.not_found   == False,
             UniverseStock.security_id != None,
         ).all()
         sec_ids = [r.security_id for r in rows]
+        if not sec_ids:
+            raise HTTPException(400, "Universe is empty — add stocks to universe first")
 
     if not sec_ids:
         raise HTTPException(400, "No security_ids found")
