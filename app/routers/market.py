@@ -41,9 +41,14 @@ async def get_ltp(
     if len(payload.security_ids) > 1000:
         raise HTTPException(400, "Max 1000 security_ids per request")
 
-    # Get master token
+    # Get master token — always fresh session to avoid stale connection
     try:
-        token, client_id = await get_master_token(db)
+        from app.core.database import SessionLocal
+        _token_db = SessionLocal()
+        try:
+            token, client_id = await get_master_token(_token_db)
+        finally:
+            _token_db.close()
     except Exception as e:
         raise HTTPException(503, f"Master token error: {e}")
 
@@ -52,6 +57,9 @@ async def get_ltp(
         prices = await fetch_ltp(token, client_id, payload.security_ids)
     except Exception as e:
         raise HTTPException(503, f"Dhan LTP fetch failed: {e}")
+    
+    # Debug log
+    print(f"[market/ltp] requested={len(payload.security_ids)} got={len(prices)} keys_sample={list(prices.keys())[:3]}")
 
     # Load prev_close from today's snapshot
     today = date.today()
@@ -132,11 +140,19 @@ async def save_snapshot(
     if not sec_ids:
         raise HTTPException(400, "No security_ids found")
 
-    # Get token
+    # Get token — fresh session
     try:
-        token, client_id = await get_master_token(db)
+        from app.core.database import SessionLocal
+        _token_db = SessionLocal()
+        try:
+            token, client_id = await get_master_token(_token_db)
+        finally:
+            _token_db.close()
     except Exception as e:
         raise HTTPException(503, f"Master token error: {e}")
+
+    # Wait before fetch to avoid 429 (market watch LTP may have just fired)
+    await asyncio.sleep(2.5)
 
     # Fetch LTP in batches
     all_prices: dict[str, float] = {}
@@ -144,10 +160,12 @@ async def save_snapshot(
         batch  = sec_ids[i:i+900]
         prices = await fetch_ltp(token, client_id, batch)
         all_prices.update(prices)
+        print(f"[snapshot] batch {i//900+1}: got {len(prices)} prices")
         if i + 900 < len(sec_ids):
-            await asyncio.sleep(1.1)
+            await asyncio.sleep(1.5)
 
     valid = {k: v for k, v in all_prices.items() if v and v > 0}
+    print(f"[snapshot] total valid prices: {len(valid)}/{len(sec_ids)}")
     today = date.today()
 
     if payload.type == "prev_close":
