@@ -149,11 +149,11 @@ async def save_snapshot(
     all_prices: dict[str, float] = {}
     for i in range(0, len(sec_ids), 900):
         batch  = sec_ids[i:i+900]
-        prices = await fetch_ltp(token, client_id, batch)
+        prices = await angel_fetch_ltp(jwt, api_key, client_id, batch)
         all_prices.update(prices)
-        print(f"[snapshot] batch {i//900+1}: got {len(prices)} prices")
-        if i + 900 < len(sec_ids):
-            await asyncio.sleep(1.5)
+        print(f"[snapshot] batch: got {len(prices)} prices")
+        if i + 50 < len(sec_ids):
+            await asyncio.sleep(1.1)
 
     valid = {k: v for k, v in all_prices.items() if v and v > 0}
     print(f"[snapshot] total valid prices: {len(valid)}/{len(sec_ids)}")
