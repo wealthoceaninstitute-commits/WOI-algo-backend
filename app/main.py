@@ -83,17 +83,16 @@ async def morning_scheduler():
         if not master_refreshed:
             print("[scheduler] WARNING: Master token refresh failed after 6 attempts")
 
-        # 4. Refresh client tokens (for order placement only)
-        # IMPORTANT: Only refresh client token AFTER master token is stable.
-        # Both use the same Dhan account — each generateAccessToken call
-        # invalidates ALL previous tokens for that account.
-        # So we refresh client token FIRST at 8:00, master token SECOND at 8:05+
-        # This ordering is now handled: master token retry runs AFTER client refresh.
-        # Since paper mode doesn't need client token for orders, skip if already done.
-        # Client token was refreshed in token_manager above — skip duplicate refresh.
-        print("[scheduler] Client token already handled by token_manager above — skipping duplicate")
+        # 4. Refresh Dhan client tokens (order placement only)
+        # Master data is now Angel One — completely separate from Dhan.
+        # No token conflict risk anymore.
+        try:
+            await scheduled_morning_refresh(SessionLocal)
+            print("[scheduler] ✓ Dhan client tokens refreshed")
+        except Exception as e:
+            print(f"[scheduler] Dhan client token refresh error: {e}")
 
-        # 4. Wait until 8:45 AM then launch algo
+        # 5. Wait until 8:45 AM then launch algo
         now_ist    = datetime.now(IST)
         target_845 = now_ist.replace(hour=8, minute=45, second=0, microsecond=0)
         if now_ist < target_845:
