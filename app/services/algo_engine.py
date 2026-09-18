@@ -691,6 +691,15 @@ async def run_daily_algo():
         jwt, api_key, master_client_id = await _fresh_master_token()
         print(f"[algo] Master token OK (client_id: {master_client_id})")
 
+        # Get feed token for WebSocket from DB
+        from app.models.master_account import MasterDataAccount
+        _acc = db.query(MasterDataAccount).first()
+        _feed_token = _acc.angel_feed_token if _acc and _acc.angel_feed_token else ""
+        if _feed_token:
+            print(f"[algo] Feed token available for WebSocket")
+        else:
+            print("[algo] WARNING: No feed token — WebSocket will not start. Run Test in Settings.")
+
         # Create/reuse today's run for each client
         for profile, strategy in clients:
             run = _get_or_create_run(profile.id, strategy.id, db)
