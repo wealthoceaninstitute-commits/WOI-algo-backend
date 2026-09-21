@@ -1,10 +1,14 @@
 """
-app/services/algo_engine.py — WOI Paper Trade Engine
+app/services/algo_engine.py — WOI Hybrid Trade Engine
 
 Architecture (DB-persisted price snapshot):
   8:45 AM  → fetch_ltp(501) → save prev_close to DailyPriceSnapshot table
   9:12:30  → fetch_ltp(501) → update open_price in same table → compute gaps
   8:00 AM (next day) → DELETE previous day snapshot before fresh fetch
+
+Trading mode (per client, switchable anytime via UI):
+  paper_trading = True  → simulate only, no real orders
+  paper_trading = False → place real orders via Dhan API
 
 Benefits:
   - Survives server restart / double-run (upsert, not overwrite)
@@ -22,7 +26,7 @@ from sqlalchemy import text
 from app.core.database import SessionLocal
 from app.models.trading import (
     ClientProfile, AlgoStrategy, AlgoRun, AlgoStock,
-    DailyPnl, DailyPriceSnapshot,
+    DailyPnl, DailyPriceSnapshot, DhanCredential,
 )
 from app.models.scrip_master import UniverseStock, ScripMaster
 from app.services.angel_one import (
@@ -33,8 +37,125 @@ from app.services.angel_ws import (
     is_ws_connected, ws_stats, stop_ws_stream
 )
 from app.services.master_token import get_master_token, clear_master_token_cache
+from app.services.dhan_trade import place_order, cancel_order
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# ── Live order helpers ────────────────────────────────────────────────────────
+
+def _get_dhan_cred(client_profile_id: str, db: Session) -> Optional[tuple[str, str]]:
+    """Fetch (access_token, dhan_client_id) for a client. Returns None if not found."""
+    cred = db.query(DhanCredential).filter(
+        DhanCredential.client_profile_id == client_profile_id,
+        DhanCredential.is_active == True,
+    ).first()
+    if not cred:
+        return None
+    return (cred.access_token, cred.dhan_client_id)
+
+
+def _is_paper(profile: ClientProfile) -> bool:
+    """True if this client is in paper trading mode."""
+    return bool(profile.paper_trading)
+
+
+async def _place_entry_order(
+    profile: ClientProfile,
+    stock: AlgoStock,
+    direction: str,   # "BUY" or "SELL"
+    ltp: float,
+    db: Session,
+    run: AlgoRun,
+) -> Optional[str]:
+    """
+    Place a real entry order via Dhan for LIVE clients.
+    Returns dhan order_id on success, None on failure.
+    """
+    cred = _get_dhan_cred(profile.id, db)
+    if not cred:
+        _log(run, f"  LIVE ERROR: No active Dhan credential for {profile.id} — skipping order", db)
+        return None
+    access_token, dhan_client_id = cred
+
+    qty = stock.quantity or 1
+    try:
+        result = await place_order(
+            access_token=access_token,
+            dhan_client_id=dhan_client_id,
+            security_id=stock.security_id,
+            exchange_segment="NSE_EQ",
+            transaction_type=direction,        # "BUY" or "SELL"
+            quantity=qty,
+            order_type="MARKET",
+            product_type="INTRADAY",
+            price=0,                           # market order
+        )
+        if result.get("success"):
+            order_id = result["data"].get("orderId") or result["data"].get("order_id")
+            _log(run,
+                f"  LIVE {direction} {stock.symbol} x{qty} @ MKT | order_id={order_id}",
+                db)
+            return order_id
+        else:
+            _log(run,
+                f"  LIVE ORDER FAILED {stock.symbol}: {result.get('data', result)}",
+                db)
+            return None
+    except Exception as e:
+        _log(run, f"  LIVE ORDER EXCEPTION {stock.symbol}: {e}", db)
+        return None
+
+
+async def _place_exit_order(
+    profile: ClientProfile,
+    stock: AlgoStock,
+    ltp: float,
+    db: Session,
+    run: AlgoRun,
+    reason: str = "SL/TGT",
+) -> Optional[str]:
+    """
+    Place a real exit order via Dhan for LIVE clients.
+    Exit direction is opposite of entry.
+    """
+    if not stock.entry_direction:
+        return None
+
+    cred = _get_dhan_cred(profile.id, db)
+    if not cred:
+        _log(run, f"  LIVE EXIT ERROR: No active Dhan credential for {profile.id}", db)
+        return None
+    access_token, dhan_client_id = cred
+
+    exit_dir = "SELL" if stock.entry_direction == "BUY" else "BUY"
+    qty = stock.quantity or 1
+    try:
+        result = await place_order(
+            access_token=access_token,
+            dhan_client_id=dhan_client_id,
+            security_id=stock.security_id,
+            exchange_segment="NSE_EQ",
+            transaction_type=exit_dir,
+            quantity=qty,
+            order_type="MARKET",
+            product_type="INTRADAY",
+            price=0,
+        )
+        if result.get("success"):
+            order_id = result["data"].get("orderId") or result["data"].get("order_id")
+            _log(run,
+                f"  LIVE EXIT {exit_dir} {stock.symbol} x{qty} @ MKT [{reason}] | order_id={order_id}",
+                db)
+            return order_id
+        else:
+            _log(run,
+                f"  LIVE EXIT FAILED {stock.symbol}: {result.get('data', result)}",
+                db)
+            return None
+    except Exception as e:
+        _log(run, f"  LIVE EXIT EXCEPTION {stock.symbol}: {e}", db)
+        return None
+
 
 FALLBACK_UNIVERSE = [
     "1333","11536","10895","15083","4963","3456","14977","1232","5258","11630",
@@ -386,7 +507,7 @@ def _apply_filters(gap_results: dict, strategy: AlgoStrategy, run: AlgoRun, db: 
 # ── Step 4: First candle ──────────────────────────────────────────────────────
 
 async def _compute_entry(security_id: str, strategy: AlgoStrategy, jwt: str, api_key: str, client_id: str) -> Optional[dict]:
-    candle = await angel_fetch_first_candle(jwt, api_key, client_id, security_id)
+    candle = await angel_fetch_first_candle(jwt, api_key, master_client_id, security_id)
     if not candle:
         return None
 
@@ -506,6 +627,12 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
         if not strategy:
             continue
 
+        # Load client profile to check paper_trading flag
+        profile = db.query(ClientProfile).filter(
+            ClientProfile.id == stock.client_profile_id
+        ).first()
+        is_paper_mode = _is_paper(profile) if profile else True
+
         try:
             trail_steps = json.loads(strategy.trail_sl_steps or "[]")
         except Exception:
@@ -515,34 +642,46 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
             buy_t  = float(stock.buy_trigger  or 0)
             sell_t = float(stock.sell_trigger or 0)
             entered = False
+            direction = None
 
             if not strategy.gap_direction_bias:
                 if buy_t and ltp >= buy_t:
-                    stock.entry_direction = "BUY";  entered = True
+                    direction = "BUY";  entered = True
                 elif sell_t and ltp <= sell_t:
-                    stock.entry_direction = "SELL"; entered = True
+                    direction = "SELL"; entered = True
             else:
                 if stock.direction == "UP"   and buy_t  and ltp >= buy_t:
-                    stock.entry_direction = "BUY";  entered = True
+                    direction = "BUY";  entered = True
                 elif stock.direction == "DOWN" and sell_t and ltp <= sell_t:
-                    stock.entry_direction = "SELL"; entered = True
+                    direction = "SELL"; entered = True
 
             if entered:
-                stock.status      = "entered"
-                stock.entry_price = ltp
-                stock.entry_time  = datetime.now(timezone.utc)
-                run.stocks_traded = (run.stocks_traded or 0) + 1
-                trig     = buy_t if stock.entry_direction == "BUY" else sell_t
-                sl_price = ltp * (1 - float(strategy.sl_pct)) if stock.entry_direction == "BUY" \
-                           else ltp * (1 + float(strategy.sl_pct))
+                stock.entry_direction = direction
+                stock.status          = "entered"
+                stock.entry_price     = ltp
+                stock.entry_time      = datetime.now(timezone.utc)
+                run.stocks_traded     = (run.stocks_traded or 0) + 1
+                trig      = buy_t if direction == "BUY" else sell_t
+                sl_price  = ltp * (1 - float(strategy.sl_pct)) if direction == "BUY" \
+                            else ltp * (1 + float(strategy.sl_pct))
                 tgt_price = ltp * (1 + float(strategy.sl_pct) * float(strategy.target_r)) \
-                            if stock.entry_direction == "BUY" \
+                            if direction == "BUY" \
                             else ltp * (1 - float(strategy.sl_pct) * float(strategy.target_r))
+                mode_label = "PAPER" if is_paper_mode else "LIVE"
                 _log(run,
-                    f"PAPER {stock.entry_direction} {stock.symbol} @ ₹{ltp:.2f} "
+                    f"{mode_label} {direction} {stock.symbol} @ ₹{ltp:.2f} "
                     f"| trigger=₹{trig:.2f} | SL=₹{sl_price:.2f} | target=₹{tgt_price:.2f} "
                     f"| qty={stock.quantity}",
                     db)
+
+                # ── LIVE: place real entry order via Dhan ──────────────────
+                if not is_paper_mode and profile:
+                    order_id = await _place_entry_order(profile, stock, direction, ltp, db, run)
+                    if direction == "BUY":
+                        stock.buy_order_id = order_id
+                    else:
+                        stock.sell_order_id = order_id
+
             db.commit()
             continue
 
@@ -564,6 +703,15 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
                     f"| entry=₹{entry:.2f} | P&L=₹{pnl:+.2f} | R:R={rr:+.2f}R",
                     db)
                 _update_daily_pnl(stock.client_profile_id, pnl, db)
+
+                # ── LIVE: place real exit order via Dhan ───────────────────
+                if not is_paper_mode and profile:
+                    exit_order_id = await _place_exit_order(profile, stock, ltp, db, run, reason)
+                    if stock.entry_direction == "BUY":
+                        stock.sell_order_id = exit_order_id
+                    else:
+                        stock.buy_order_id = exit_order_id
+
         db.commit()
 
 
@@ -582,18 +730,29 @@ async def _force_exit_all(db: Session, jwt: str, api_key: str, client_id: str):
 
     for stock in stocks:
         ltp = ltp_map.get(str(stock.security_id), float(stock.entry_price or 0))
-        pnl = _calc_pnl(stock, ltp) if stock.status == "entered" else 0
+        was_entered = stock.status == "entered"
+        pnl = _calc_pnl(stock, ltp) if was_entered else 0
         stock.status      = "exited"
         stock.exit_price  = ltp
         stock.exit_time   = datetime.now(timezone.utc)
         stock.exit_reason = "EOD"
         stock.pnl         = pnl
+
         run = db.query(AlgoRun).filter(AlgoRun.id == stock.run_id).first()
         if run:
             run.total_pnl = float(run.total_pnl or 0) + pnl
             _log(run, f"FORCE EXIT {stock.symbol} @ ₹{ltp:.2f} [EOD] | P&L=₹{pnl:+.2f}", db)
+
         if pnl != 0:
             _update_daily_pnl(stock.client_profile_id, pnl, db)
+
+        # ── LIVE: place EOD exit order via Dhan ───────────────────────────
+        if was_entered:
+            profile = db.query(ClientProfile).filter(
+                ClientProfile.id == stock.client_profile_id
+            ).first()
+            if profile and not _is_paper(profile):
+                await _place_exit_order(profile, stock, ltp, db, run, "EOD")
 
     db.commit()
 
