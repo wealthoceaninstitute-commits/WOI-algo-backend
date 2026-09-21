@@ -386,7 +386,7 @@ def _apply_filters(gap_results: dict, strategy: AlgoStrategy, run: AlgoRun, db: 
 # ── Step 4: First candle ──────────────────────────────────────────────────────
 
 async def _compute_entry(security_id: str, strategy: AlgoStrategy, jwt: str, api_key: str, client_id: str) -> Optional[dict]:
-    candle = await angel_fetch_first_candle(jwt, api_key, master_client_id, security_id)
+    candle = await angel_fetch_first_candle(jwt, api_key, client_id, security_id)
     if not candle:
         return None
 
