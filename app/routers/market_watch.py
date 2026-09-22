@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models.trading import AlgoStrategy, AlgoStock, ClientProfile
+from app.models.trading import AlgoStrategy, AlgoStock, AlgoRun, ClientProfile
 from app.services.master_token import get_master_token
 from app.services.angel_one import angel_fetch_candle
 
@@ -53,15 +53,41 @@ async def _refresh_once(db: Session) -> dict:
         return {"error": "No master token — check AngelOneCredential in DB"}
     jwt_token, api_key, client_id = token_result
 
-    # ── 2. Collect active algo stocks (any enabled strategy) ─────────────────
-    stocks: list[AlgoStock] = (
-        db.query(AlgoStock)
-        .join(AlgoStrategy)
-        .filter(AlgoStrategy.is_active == True)
-        .all()
-    )
+    # ── 2. Collect active algo stocks (watching or entered today) ────────────
+    from datetime import date as _date
+    today = _date.today()
+    # Get all runs for today that belong to an active strategy
+    active_strategy_ids = [
+        s.id for s in db.query(AlgoStrategy).filter(AlgoStrategy.is_active == True).all()
+    ]
+    today_run_ids = [
+        r.id for r in db.query(AlgoRun).filter(
+            AlgoRun.run_date == today,
+            AlgoRun.strategy_id.in_(active_strategy_ids),
+        ).all()
+    ] if active_strategy_ids else []
+
+    stocks: list[AlgoStock] = []
+    if today_run_ids:
+        stocks = (
+            db.query(AlgoStock)
+            .filter(
+                AlgoStock.run_id.in_(today_run_ids),
+                AlgoStock.status.in_(["watching", "entered"]),
+            )
+            .all()
+        )
+
     if not stocks:
-        return {"error": "No active algo stocks found"}
+        # Fallback: show ALL today's stocks even if exited (so dashboard isn't empty)
+        if today_run_ids:
+            stocks = (
+                db.query(AlgoStock)
+                .filter(AlgoStock.run_id.in_(today_run_ids))
+                .all()
+            )
+    if not stocks:
+        return {"error": "No algo stocks found for today. Run the algo first."}
 
     # Deduplicate by security_id; map security_id → symbol name
     stock_map: dict[str, str] = {}
@@ -161,19 +187,26 @@ async def market_watch_debug(db: Session = Depends(get_db)):
         results["master_token"] = f"ERROR: {e}"
         results["master_token_trace"] = _tb.format_exc()
 
-    # Test 2: active stocks
+    # Test 2: active strategies
     try:
-        stocks = (
-            db.query(AlgoStock)
-            .join(AlgoStrategy)
-            .filter(AlgoStrategy.is_active == True)
-            .all()
-        )
-        results["active_stocks"] = [
-            {"security_id": s.security_id, "symbol": s.symbol} for s in stocks
+        strats = db.query(AlgoStrategy).filter(AlgoStrategy.is_active == True).all()
+        results["active_strategies"] = [{"id": s.id, "name": getattr(s, "name", str(s.id))} for s in strats]
+    except Exception as e:
+        results["active_strategies"] = f"ERROR: {e}"
+
+    # Test 3: today's algo stocks
+    try:
+        from datetime import date as _date
+        today = _date.today()
+        runs = db.query(AlgoRun).filter(AlgoRun.run_date == today).all()
+        results["today_runs"] = len(runs)
+        run_ids = [r.id for r in runs]
+        stocks = db.query(AlgoStock).filter(AlgoStock.run_id.in_(run_ids)).all() if run_ids else []
+        results["today_stocks"] = [
+            {"security_id": s.security_id, "symbol": s.symbol, "status": s.status} for s in stocks
         ]
     except Exception as e:
-        results["active_stocks"] = f"ERROR: {e}"
+        results["today_stocks"] = f"ERROR: {e}"
 
     return results
 
