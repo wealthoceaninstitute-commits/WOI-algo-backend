@@ -48,7 +48,7 @@ async def _refresh_once(db: Session) -> dict:
     update the in-memory store.  Returns the current store snapshot.
     """
     # ── 1. Get master Angel One token ────────────────────────────────────────
-    token_result = get_master_token(db)
+    token_result = await get_master_token(db)
     if not token_result:
         return {"error": "No master token — check AngelOneCredential in DB"}
     jwt_token, api_key, client_id = token_result
@@ -174,3 +174,138 @@ async def stream_market_watch(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── Serve the HTML dashboard directly from Railway ────────────────────────────
+# Open: https://your-railway-url.up.railway.app/api/market-watch/dashboard
+# No file:// restriction, no CORS issue — served from the same origin.
+
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>WOI Market Watch</title>
+<style>
+  :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--accent:#1f6feb}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
+  header{background:var(--card);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;gap:16px}
+  header h1{font-size:1.1rem;font-weight:600}
+  .badge{font-size:.72rem;padding:3px 8px;border-radius:12px;font-weight:600}
+  .badge-live{background:#1a3a1a;color:var(--green);border:1px solid var(--green)}
+  .badge-err{background:#3a1a1a;color:var(--red);border:1px solid var(--red)}
+  .badge-wait{background:#2a2a10;color:var(--yellow);border:1px solid var(--yellow)}
+  #status-bar{font-size:.8rem;color:var(--muted);margin-left:auto}
+  main{padding:20px 24px}
+  .controls{display:flex;gap:12px;margin-bottom:20px;align-items:center;flex-wrap:wrap}
+  button{background:var(--accent);color:#fff;border:none;border-radius:6px;padding:7px 16px;font-size:.85rem;cursor:pointer;font-weight:600}
+  button:hover{background:#388bfd}
+  button.secondary{background:var(--card);border:1px solid var(--border);color:var(--text)}
+  button.secondary:hover{background:#21262d}
+  #countdown{font-size:.82rem;color:var(--muted);margin-left:auto}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(520px,1fr));gap:16px}
+  .stock-card{background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  .stock-header{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);background:#1c2128}
+  .stock-symbol{font-weight:700;font-size:1rem}
+  .stock-sid{font-size:.72rem;color:var(--muted)}
+  .candle-count{font-size:.72rem;color:var(--muted);margin-left:auto}
+  .updated{font-size:.72rem;color:var(--blue)}
+  table{width:100%;border-collapse:collapse;font-size:.82rem}
+  th{text-align:right;padding:7px 12px;color:var(--muted);font-weight:500;font-size:.75rem;border-bottom:1px solid var(--border)}
+  th:first-child{text-align:left}
+  td{text-align:right;padding:6px 12px;border-bottom:1px solid #21262d;font-variant-numeric:tabular-nums}
+  td:first-child{text-align:left;color:var(--muted);font-size:.78rem}
+  tr.newest td{background:rgba(63,185,80,.07)}
+  tr:last-child td{border-bottom:none}
+  .up{color:var(--green)}.dn{color:var(--red)}
+  .empty{padding:24px 16px;color:var(--muted);font-size:.85rem;text-align:center}
+  .error-card{background:#1a0d0d;border:1px solid var(--red);border-radius:10px;padding:20px;color:var(--red);font-size:.9rem}
+  #loading{text-align:center;padding:60px;color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<header>
+  <h1>📊 WOI Market Watch</h1>
+  <span id="status-badge" class="badge badge-wait">Connecting…</span>
+  <span id="status-bar">—</span>
+</header>
+<main>
+  <div class="controls">
+    <span style="font-size:.82rem;color:var(--muted)">Auto-polling every 62s from this server</span>
+    <button onclick="fetchOnce()">↺ Refresh Now</button>
+    <button class="secondary" onclick="stopPolling()">⏸ Pause</button>
+    <span id="countdown">—</span>
+  </div>
+  <div id="grid" class="grid"><div id="loading">Loading candle data…</div></div>
+</main>
+<script>
+const POLL_MS=62000;
+let timer=null,countdown=null,secondsLeft=0;
+function setBadge(t,x){const b=document.getElementById('status-badge');b.className='badge badge-'+t;b.textContent=x}
+function setStatus(t){document.getElementById('status-bar').textContent=t}
+function startCountdown(){clearInterval(countdown);secondsLeft=Math.round(POLL_MS/1000);const el=document.getElementById('countdown');countdown=setInterval(()=>{if(secondsLeft<=0){el.textContent='Refreshing…';return}el.textContent='Next: '+(secondsLeft--)+'s'},1000)}
+async function fetchOnce(){
+  try{
+    setBadge('wait','Fetching…');
+    const res=await fetch('/api/market-watch/candles');
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const data=await res.json();
+    renderData(data);
+    setBadge('live','🟢 LIVE');
+    setStatus('as of '+data.as_of+' · window: '+data.window_minutes+' min');
+    startCountdown();
+  }catch(e){
+    setBadge('err','Error');
+    setStatus(e.message);
+    document.getElementById('grid').innerHTML='<div class="error-card">❌ '+e.message+'</div>';
+  }
+}
+function renderData(data){
+  const stocks=data.stocks||{};
+  const keys=Object.keys(stocks);
+  const grid=document.getElementById('grid');
+  if('error' in stocks){grid.innerHTML='<div class="error-card">⚠️ '+stocks.error+'</div>';return}
+  if(keys.length===0){grid.innerHTML='<div id="loading">No active algo stocks. Enable a strategy first.</div>';return}
+  grid.innerHTML='';
+  keys.forEach(sid=>{
+    const s=stocks[sid];
+    const candles=(s.candles||[]).slice().reverse();
+    const card=document.createElement('div');card.className='stock-card';
+    const ltp=candles.length?candles[0].close:null;
+    const prev=candles.length>1?candles[1].close:null;
+    const dir=ltp&&prev?(ltp>=prev?'up':'dn'):'';
+    card.innerHTML=`<div class="stock-header">
+      <span class="stock-symbol">${s.symbol}</span>
+      <span class="stock-sid">#${sid}</span>
+      ${ltp?`<span class="${dir}">${dir==='up'?'▲':'▼'} ₹${ltp.toFixed(2)}</span>`:''}
+      <span class="candle-count">${candles.length} candle${candles.length!==1?'s':''}</span>
+      <span class="updated">⏱ ${s.last_updated}</span>
+    </div>
+    ${candles.length===0?'<div class="empty">No candle data yet — market may not be open.</div>':`
+    <table><thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th></tr></thead>
+    <tbody>${candles.map((c,i)=>{
+      const ts=c.timestamp?c.timestamp.substring(11,16):'—';
+      const chg=i<candles.length-1?(c.close-candles[i+1].close)/candles[i+1].close*100:0;
+      const cls=chg>0?'up':chg<0?'dn':'';
+      return `<tr class="${i===0?'newest':''}"><td>${ts}</td><td>${c.open?.toFixed(2)??'—'}</td><td>${c.high?.toFixed(2)??'—'}</td><td>${c.low?.toFixed(2)??'—'}</td><td class="${cls}">${c.close?.toFixed(2)??'—'}${chg!==0?` <small>(${chg>0?'+':''}${chg.toFixed(2)}%)</small>`:''}</td><td>${c.volume?.toLocaleString('en-IN')??'—'}</td></tr>`;
+    }).join('')}</tbody></table>`}`;
+    grid.appendChild(card);
+  });
+}
+function stopPolling(){clearInterval(timer);clearInterval(countdown);timer=null;setBadge('wait','Paused');document.getElementById('countdown').textContent='Paused'}
+fetchOnce();
+timer=setInterval(fetchOnce,POLL_MS);
+</script>
+</body>
+</html>"""
+
+
+@router.get("/dashboard", response_class=None)
+async def market_watch_dashboard():
+    """
+    Open this in your browser: https://your-railway-url/api/market-watch/dashboard
+    Served from Railway itself — no file:// CORS issues.
+    """
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=_DASHBOARD_HTML)
