@@ -12,8 +12,6 @@ from app.routers import master_account, universe, algo_stats
 from app.services.token_manager import scheduled_morning_refresh
 from app.services.algo_engine import run_daily_algo, cleanup_old_snapshots
 from app.services.scrip_downloader import download_and_update
-from app.routers.market_watch import router as market_watch_router
-app.include_router(market_watch_router)
 
 settings = get_settings()
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -86,8 +84,6 @@ async def morning_scheduler():
             print("[scheduler] WARNING: Master token refresh failed after 6 attempts")
 
         # 4. Refresh Dhan client tokens (order placement only)
-        # Master data is now Angel One — completely separate from Dhan.
-        # No token conflict risk anymore.
         try:
             await scheduled_morning_refresh(SessionLocal)
             print("[scheduler] ✓ Dhan client tokens refreshed")
@@ -150,6 +146,10 @@ app.include_router(master_account.router)
 app.include_router(universe.router)
 app.include_router(algo_stats.router)
 app.include_router(market.router)
+
+# ── Market Watch (candle verification tool) ───────────────────────────────────
+from app.routers.market_watch import router as market_watch_router
+app.include_router(market_watch_router)
 
 
 @app.get("/", tags=["health"])
