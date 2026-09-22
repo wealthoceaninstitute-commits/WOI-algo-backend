@@ -130,13 +130,52 @@ async def get_market_watch_candles(
     Fetch and return the latest rolling 5-min 1-min candles for all
     active algo stocks.  Call this every 60 s from the frontend.
     """
-    snapshot = await _refresh_once(db)
+    import traceback as _tb
+    try:
+        snapshot = await _refresh_once(db)
+    except Exception as exc:
+        err = _tb.format_exc()
+        print(f"[market-watch] UNHANDLED ERROR:\n{err}")
+        snapshot = {"error": f"{type(exc).__name__}: {exc}"}
     now_ist = datetime.now(IST)
     return {
         "as_of": now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
         "window_minutes": KEEP_MINUTES,
         "stocks": snapshot,
     }
+
+
+@router.get("/debug")
+async def market_watch_debug(db: Session = Depends(get_db)):
+    """Quick diagnostic — GET /api/market-watch/debug to see what's failing."""
+    import traceback as _tb
+    results = {}
+
+    # Test 1: master token
+    try:
+        tok = await get_master_token(db)
+        results["master_token"] = "OK" if tok else "None returned"
+        if tok:
+            results["client_id"] = tok[2]
+    except Exception as e:
+        results["master_token"] = f"ERROR: {e}"
+        results["master_token_trace"] = _tb.format_exc()
+
+    # Test 2: active stocks
+    try:
+        stocks = (
+            db.query(AlgoStock)
+            .join(AlgoStrategy)
+            .filter(AlgoStrategy.is_enabled == True)
+            .all()
+        )
+        results["active_stocks"] = [
+            {"security_id": s.security_id, "symbol": s.symbol} for s in stocks
+        ]
+    except Exception as e:
+        results["active_stocks"] = f"ERROR: {e}"
+
+    return results
 
 
 # ── SSE streaming endpoint ────────────────────────────────────────────────────
