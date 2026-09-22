@@ -57,7 +57,7 @@ async def _refresh_once(db: Session) -> dict:
     stocks: list[AlgoStock] = (
         db.query(AlgoStock)
         .join(AlgoStrategy)
-        .filter(AlgoStrategy.is_enabled == True)
+        .filter(AlgoStrategy.is_active == True)
         .all()
     )
     if not stocks:
@@ -166,7 +166,7 @@ async def market_watch_debug(db: Session = Depends(get_db)):
         stocks = (
             db.query(AlgoStock)
             .join(AlgoStrategy)
-            .filter(AlgoStrategy.is_enabled == True)
+            .filter(AlgoStrategy.is_active == True)
             .all()
         )
         results["active_stocks"] = [
