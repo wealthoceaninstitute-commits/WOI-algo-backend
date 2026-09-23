@@ -681,6 +681,8 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
                         stock.buy_order_id = order_id
                     else:
                         stock.sell_order_id = order_id
+                    # Note: trigger orders fill asynchronously — actual fill price
+                    # will be fetched via Dhan order status API when needed
 
             db.commit()
             continue
@@ -711,6 +713,8 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
                         stock.sell_order_id = exit_order_id
                     else:
                         stock.buy_order_id = exit_order_id
+                    # Note: trigger orders fill asynchronously — actual fill price
+                    # will be fetched via Dhan order status API when needed
 
         db.commit()
 
@@ -1021,12 +1025,12 @@ async def run_daily_algo():
                         ))
                 db.commit()
 
-        # ── STEP 4: 9:16:05 first candle ───────────────────────────────
+        # ── STEP 4: 9:16:00 first candle ───────────────────────────────
         for _, (run, _) in runs.items():
-            _log_separator(run, "STEP 3: FIRST CANDLE (9:16:05)", db)
-            _log(run, "Waiting for 9:16:05 — first 1-min candle closes at 9:16:00...", db)
+            _log_separator(run, "STEP 3: FIRST CANDLE (9:16:00)", db)
+            _log(run, "Waiting for 9:16:00 — fetching as soon as first 1-min candle closes...", db)
 
-        await _wait_until(9, 16, 5, "first candle")
+        await _wait_until(9, 16, 0, "first candle")
         jwt, api_key, master_client_id = await _fresh_master_token()
 
         for profile, strategy in clients:
@@ -1090,14 +1094,18 @@ async def run_daily_algo():
 
             if tick_count % 60 == 0:
                 elapsed    = (datetime.now(IST) - now_ist).seconds // 60
+                today_run_ids = [run.id for run, _ in runs.values()]
                 open_count = db.query(AlgoStock).filter(
-                    AlgoStock.status.in_(["watching", "entered"])
+                    AlgoStock.run_id.in_(today_run_ids),
+                    AlgoStock.status.in_(["watching", "entered"]),
                 ).count()
                 for _, (run, _) in runs.items():
                     _log(run, f"Heartbeat: {elapsed}min elapsed | {open_count} position(s) still open", db)
 
+            today_run_ids = [run.id for run, _ in runs.values()]
             open_count = db.query(AlgoStock).filter(
-                AlgoStock.status.in_(["watching", "entered"])
+                AlgoStock.run_id.in_(today_run_ids),
+                AlgoStock.status.in_(["watching", "entered"]),
             ).count()
             if open_count == 0:
                 for _, (run, _) in runs.items():
