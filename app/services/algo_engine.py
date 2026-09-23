@@ -1088,25 +1088,24 @@ async def run_daily_algo():
                 jwt, api_key, master_client_id = await _fresh_master_token()
                 await _monitor_tick(db, jwt, api_key, master_client_id)
             except Exception as e:
-                print(f"[algo] Monitor tick error: {e}")
+                import traceback as _tb
+                tb = _tb.format_exc()
+                print(f"[algo] Monitor tick error: {type(e).__name__}: {e}\n{tb}")
                 for _, (run, _) in runs.items():
-                    _log(run, f"Monitor tick error: {e}", db)
+                    _log(run, f"Monitor tick error: {type(e).__name__}: {e} | {tb.splitlines()[-2] if tb else ''}", db)
 
-            if tick_count % 60 == 0:
-                elapsed    = (datetime.now(IST) - now_ist).seconds // 60
-                today_run_ids = [run.id for run, _ in runs.values()]
-                open_count = db.query(AlgoStock).filter(
-                    AlgoStock.run_id.in_(today_run_ids),
-                    AlgoStock.status.in_(["watching", "entered"]),
-                ).count()
-                for _, (run, _) in runs.items():
-                    _log(run, f"Heartbeat: {elapsed}min elapsed | {open_count} position(s) still open", db)
-
+            # Check open positions every tick — exit early when all closed
             today_run_ids = [run.id for run, _ in runs.values()]
             open_count = db.query(AlgoStock).filter(
                 AlgoStock.run_id.in_(today_run_ids),
                 AlgoStock.status.in_(["watching", "entered"]),
             ).count()
+
+            if tick_count % 60 == 0:
+                elapsed = (datetime.now(IST) - now_ist).seconds // 60
+                for _, (run, _) in runs.items():
+                    _log(run, f"Heartbeat: {elapsed}min elapsed | {open_count} position(s) still open", db)
+
             if open_count == 0:
                 for _, (run, _) in runs.items():
                     _log(run, "All positions closed — stopping monitor loop early", db)
