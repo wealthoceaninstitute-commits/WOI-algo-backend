@@ -900,64 +900,59 @@ async def run_daily_algo():
         else:
             print("[algo] Skipping WebSocket — no feed token")
 
-        # ── STEP 1: 8:45 AM — prev close snapshot → DB ─────────────────
-        for _, (run, _) in runs.items():
-            _log_separator(run, "STEP 1: PREV CLOSE SNAPSHOT (8:45 AM)", db)
-            _log(run, "Waiting for 8:45 AM to fetch prev close LTP...", db)
+        # ══════════════════════════════════════════════════════════════════
+        # CENTRAL MARKET DATA STEPS — run ONCE for all subscribers
+        # Steps 1–2 are master-account operations; no per-client logging
+        # ══════════════════════════════════════════════════════════════════
 
+        # ── STEP 1: 8:45 AM — prev close snapshot → DB ─────────────────
+        print("[algo] ─── STEP 1: PREV CLOSE SNAPSHOT (8:45 AM) ───")
         await _wait_until(8, 45, 0, "prev close snapshot")
         jwt, api_key, master_client_id = await _fresh_master_token()
 
-        # Check if today's snapshot already has prev_close (double-run guard)
         existing = db.query(DailyPriceSnapshot).filter(
             DailyPriceSnapshot.trade_date == date.today(),
             DailyPriceSnapshot.prev_close != None,
         ).count()
 
-        for _, (run, _) in runs.items():
-            if existing >= len(combined_universe) * 0.9:
-                _log(run, f"Prev close already in DB ({existing} rows) — skipping re-fetch", db)
-            else:
-                _log(run, f"Fetching LTP for {len(combined_universe)} stocks as prev close baseline...", db)
-
         if existing < len(combined_universe) * 0.9:
+            print(f"[algo] Fetching prev close LTP for {len(combined_universe)} stocks...")
             saved = await _fetch_and_save_prev_close(jwt, api_key, master_client_id, combined_universe, db)
-            for _, (run, _) in runs.items():
-                _log(run, f"Prev close snapshot: {saved}/{len(combined_universe)} stocks saved to DB", db)
-                if saved < len(combined_universe) * 0.9:
-                    _log(run, f"WARNING: Only {saved} of {len(combined_universe)} stocks returned LTP — check master data account", db)
+            print(f"[algo] Prev close snapshot: {saved}/{len(combined_universe)} stocks saved")
+            if saved < len(combined_universe) * 0.9:
+                print(f"[algo] WARNING: Only {saved} of {len(combined_universe)} returned LTP")
         else:
             print(f"[algo] Prev close already in DB ({existing} rows) — skipping fetch")
 
-        # ── STEP 2: 9:12:30 — opening price → DB → compute gaps ────────
+        # Log once to each client's run (summary only)
         for _, (run, _) in runs.items():
-            _log_separator(run, "STEP 2: OPENING PRICE SCAN (9:12:30)", db)
-            _log(run, "Waiting for 9:12:30 to fetch pre-open prices...", db)
+            _log_separator(run, "STEP 1: PREV CLOSE SNAPSHOT", db)
+            _log(run, f"Master: prev close snapshot done — {max(existing, 0)} stocks in DB", db)
 
-        # Keep token alive during wait — ping Dhan every 20 min with 1 stock LTP
-        # Dhan market data tokens expire after ~30 min of inactivity
+        # ── STEP 2: 9:12:30 — opening price → DB → compute gaps ────────
+        print("[algo] ─── STEP 2: OPENING PRICE SCAN (9:12:30) ───")
         await _keep_token_alive_until(9, 12, 30, jwt, api_key, master_client_id)
-        # Re-use same token (no new login — cache serves it)
         jwt, api_key, master_client_id = await _fresh_master_token()
 
-        for _, (run, _) in runs.items():
-            _log(run, f"Fetching opening LTP for {len(combined_universe)} stocks...", db)
-
-        open_count = await _fetch_and_save_open_price(jwt, api_key, master_client_id, combined_universe, db)
+        print(f"[algo] Fetching opening LTP for {len(combined_universe)} stocks...")
+        open_saved = await _fetch_and_save_open_price(jwt, api_key, master_client_id, combined_universe, db)
 
         # Load gap results from DB (single source of truth)
         all_gaps = _load_gaps_from_db(combined_universe, db)
 
+        bands = {"0–1%": 0, "1–3%": 0, "3–8%": 0, "8%+": 0}
+        for d in all_gaps.values():
+            g = abs(d["gap_pct"])
+            if g < 1:   bands["0–1%"] += 1
+            elif g < 3: bands["1–3%"] += 1
+            elif g < 8: bands["3–8%"] += 1
+            else:       bands["8%+"]  += 1
+        print(f"[algo] Opening prices: {open_saved} stocks | Gap distribution: {bands}")
+
+        # Log once to each client's run (summary only)
         for _, (run, _) in runs.items():
-            _log(run, f"Opening prices fetched: {open_count} stocks", db)
-            _log(run, f"Gap computed for {len(all_gaps)} stocks (from DB snapshot)", db)
-            bands = {"0–1%": 0, "1–3%": 0, "3–8%": 0, "8%+": 0}
-            for d in all_gaps.values():
-                g = abs(d["gap_pct"])
-                if g < 1:   bands["0–1%"] += 1
-                elif g < 3: bands["1–3%"] += 1
-                elif g < 8: bands["3–8%"] += 1
-                else:       bands["8%+"]  += 1
+            _log_separator(run, "STEP 2: OPENING PRICE SCAN", db)
+            _log(run, f"Master: {open_saved} opening prices fetched | Gap computed for {len(all_gaps)} stocks", db)
             _log(run, f"Gap distribution: {bands}", db)
 
         # ── STEP 3: Filter & select ─────────────────────────────────────
@@ -1026,31 +1021,37 @@ async def run_daily_algo():
                 db.commit()
 
         # ── STEP 4: 9:16:00 first candle ───────────────────────────────
-        for _, (run, _) in runs.items():
-            _log_separator(run, "STEP 3: FIRST CANDLE (9:16:00)", db)
-            _log(run, "Waiting for 9:16:00 — fetching as soon as first 1-min candle closes...", db)
-
+        # Fetch candle ONCE per unique security_id across all clients
+        print("[algo] ─── STEP 3: FIRST CANDLE (9:16:00) ───")
         await _wait_until(9, 16, 0, "first candle")
         jwt, api_key, master_client_id = await _fresh_master_token()
 
-        for profile, strategy in clients:
+        # Collect all unique security_ids across all client runs
+        all_watching: dict[str, list] = {}  # security_id → [AlgoStock, ...]
+        for profile, _ in clients:
             run, strat = runs[profile.id]
             run.status = "running"
             db.commit()
-
             stocks = db.query(AlgoStock).filter(
                 AlgoStock.run_id == run.id, AlgoStock.status == "watching"
             ).all()
-
-            if not stocks:
-                _log(run, "No stocks to fetch candle for (none selected in previous step)", db)
-                continue
-
-            _log(run, f"Fetching first 1-min candle for {len(stocks)} selected stocks...", db)
-
             for stock in stocks:
-                _log(run, f"Fetching candle for {stock.symbol} (security_id={stock.security_id})...", db)
-                entry = await _compute_entry(stock.security_id, strat, jwt, api_key, master_client_id)
+                all_watching.setdefault(stock.security_id, []).append((stock, strat, run))
+
+        print(f"[algo] Fetching first candle for {len(all_watching)} unique stocks (across all clients)...")
+
+        # One candle API call per unique security_id
+        candle_cache: dict[str, Optional[dict]] = {}
+        for sid in all_watching:
+            _, strat, _ = all_watching[sid][0]
+            entry = await _compute_entry(sid, strat, jwt, api_key, master_client_id)
+            candle_cache[sid] = entry
+            await asyncio.sleep(0.3)
+
+        # Apply candle results to each client's AlgoStock rows
+        for sid, stock_list in all_watching.items():
+            entry = candle_cache.get(sid)
+            for stock, strat, run in stock_list:
                 if entry:
                     stock.candle_high   = entry["candle_high"]
                     stock.candle_low    = entry["candle_low"]
@@ -1063,17 +1064,18 @@ async def run_daily_algo():
                         f"H=₹{entry['candle_high']:.2f} "
                         f"L=₹{entry['candle_low']:.2f} "
                         f"C=₹{entry['candle_close']:.2f} | "
-                        f"BUY trigger=₹{entry['buy_trigger']:.2f} | "
-                        f"SELL trigger=₹{entry['sell_trigger']:.2f} | "
+                        f"BUY=₹{entry['buy_trigger']:.2f} | "
+                        f"SELL=₹{entry['sell_trigger']:.2f} | "
                         f"Qty={entry['quantity']}",
                         db)
                 else:
                     stock.status = "cancelled"
                     _log(run, f"{stock.symbol}: No candle data — skipped", db)
                 db.commit()
-                await asyncio.sleep(0.3)
 
         # ── STEP 5: Monitor loop ────────────────────────────────────────
+        # Single central loop — monitors all clients' positions in one pass
+        print("[algo] ─── STEP 4: MONITORING — checking LTP every 5s until 3:20 PM ───")
         for _, (run, _) in runs.items():
             _log_separator(run, "STEP 4: MONITORING", db)
             _log(run, "Monitor loop started — checking LTP every 5s until 3:20 PM", db)
@@ -1103,10 +1105,17 @@ async def run_daily_algo():
 
             if tick_count % 60 == 0:
                 elapsed = (datetime.now(IST) - now_ist).seconds // 60
-                for _, (run, _) in runs.items():
-                    _log(run, f"Heartbeat: {elapsed}min elapsed | {open_count} position(s) still open", db)
+                print(f"[algo] Heartbeat: {elapsed}min elapsed | {open_count} position(s) open across all clients")
+                # Log per-client open count
+                for pid, (run, _) in runs.items():
+                    client_open = db.query(AlgoStock).filter(
+                        AlgoStock.run_id == run.id,
+                        AlgoStock.status.in_(["watching", "entered"]),
+                    ).count()
+                    _log(run, f"Heartbeat: {elapsed}min elapsed | {client_open} position(s) open", db)
 
             if open_count == 0:
+                print("[algo] All positions closed across all clients — stopping monitor loop")
                 for _, (run, _) in runs.items():
                     _log(run, "All positions closed — stopping monitor loop early", db)
                 break
