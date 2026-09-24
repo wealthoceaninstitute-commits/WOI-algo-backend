@@ -10,6 +10,8 @@ Endpoints:
   DELETE   /api/algo/runs/{id}/stocks/{stock_id} — remove a stock
 
 Master:
+  GET      /api/algo/master-config          — get central master config (id=1)
+  PUT      /api/algo/master-config          — save master config + push to ALL clients
   GET      /api/algo/all              — all clients' strategy configs
   PUT      /api/algo/{profile_id}/strategy — update any client's strategy
   GET      /api/algo/{profile_id}/runs     — any client's runs
@@ -26,7 +28,7 @@ from fastapi import BackgroundTasks
 from datetime import datetime, timezone
 from app.core.security import get_current_user, require_master
 from app.models.user import User
-from app.models.trading import ClientProfile, AlgoStrategy, AlgoRun, AlgoStock
+from app.models.trading import ClientProfile, AlgoStrategy, AlgoRun, AlgoStock, MasterAlgoConfig
 from app.schemas.algo import (
     AlgoStrategyRequest, AlgoStrategyResponse,
     AlgoRunResponse, AlgoStockResponse,
@@ -129,6 +131,186 @@ def _ser_stock(s: AlgoStock) -> dict:
         "sell_order_id": s.sell_order_id,
         "source": s.source,
     }
+
+
+# Fields synced between MasterAlgoConfig and every AlgoStrategy row
+MASTER_FIELDS = [
+    "universe_id", "gap_min", "gap_max", "max_stocks_per_day", "live_scan_seconds",
+    "min_price", "max_price", "min_volume", "min_turnover_cr", "exclude_be_series",
+    "risk_per_trade", "entry_buffer_pct", "sl_pct", "entry_reference",
+    "use_first_candle", "disable_shift", "gap_direction_bias", "boring_ratio",
+    "entry_missed_cancel", "entry_missed_cancel_r", "sl_basis",
+    "target_r", "trail_sl_steps", "tp_on_exchange", "tp_exchange_place_r",
+    "tp_exchange_cancel_r", "reentry_mode", "max_reentry_attempts",
+]
+
+
+def _ser_master_config(cfg: MasterAlgoConfig) -> dict:
+    """Serialize MasterAlgoConfig row to dict for frontend."""
+    trail = cfg.trail_sl_steps
+    if isinstance(trail, str):
+        try:
+            trail = json.loads(trail)
+        except Exception:
+            trail = []
+
+    return {
+        "universe_id":           cfg.universe_id,
+        "gap_min":               float(cfg.gap_min) if cfg.gap_min is not None else 3.0,
+        "gap_max":               float(cfg.gap_max) if cfg.gap_max is not None else 8.0,
+        "max_stocks_per_day":    cfg.max_stocks_per_day or 5,
+        "live_scan_seconds":     cfg.live_scan_seconds or 60,
+        "min_price":             float(cfg.min_price) if cfg.min_price is not None else 50.0,
+        "max_price":             float(cfg.max_price) if cfg.max_price is not None else 10000.0,
+        "min_volume":            cfg.min_volume or 500000,
+        "min_turnover_cr":       float(cfg.min_turnover_cr) if cfg.min_turnover_cr is not None else 10.0,
+        "exclude_be_series":     bool(cfg.exclude_be_series),
+        "risk_per_trade":        float(cfg.risk_per_trade) if cfg.risk_per_trade is not None else 400.0,
+        "entry_buffer_pct":      float(cfg.entry_buffer_pct) if cfg.entry_buffer_pct is not None else 0.004,
+        "sl_pct":                float(cfg.sl_pct) if cfg.sl_pct is not None else 0.004,
+        "entry_reference":       cfg.entry_reference or "close",
+        "use_first_candle":      bool(cfg.use_first_candle),
+        "disable_shift":         bool(cfg.disable_shift),
+        "gap_direction_bias":    bool(cfg.gap_direction_bias),
+        "boring_ratio":          float(cfg.boring_ratio) if cfg.boring_ratio is not None else 0.35,
+        "entry_missed_cancel":   bool(cfg.entry_missed_cancel),
+        "entry_missed_cancel_r": float(cfg.entry_missed_cancel_r) if cfg.entry_missed_cancel_r is not None else 1.5,
+        "sl_basis":              cfg.sl_basis or "trigger",
+        "target_r":              float(cfg.target_r) if cfg.target_r is not None else 4.0,
+        "trail_sl_steps":        trail if trail else [],
+        "tp_on_exchange":        bool(cfg.tp_on_exchange),
+        "tp_exchange_place_r":   float(cfg.tp_exchange_place_r) if cfg.tp_exchange_place_r is not None else 2.0,
+        "tp_exchange_cancel_r":  float(cfg.tp_exchange_cancel_r) if cfg.tp_exchange_cancel_r is not None else 1.0,
+        "reentry_mode":          cfg.reentry_mode or "both_sides",
+        "max_reentry_attempts":  cfg.max_reentry_attempts or 0,
+        "updated_at":            cfg.updated_at.isoformat() if cfg.updated_at else None,
+    }
+
+
+def _bootstrap_from_first_strategy(first: AlgoStrategy) -> dict:
+    """Use first client AlgoStrategy as seed when master row doesn't exist yet."""
+    trail = first.trail_sl_steps
+    if isinstance(trail, str):
+        try:
+            trail = json.loads(trail)
+        except Exception:
+            trail = [[2.5, 0.0], [3.0, 0.5], [3.7, 2.0]]
+    return {
+        "universe_id":           first.universe_id,
+        "gap_min":               float(first.gap_min) if first.gap_min is not None else 3.0,
+        "gap_max":               float(first.gap_max) if first.gap_max is not None else 8.0,
+        "max_stocks_per_day":    first.max_stocks_per_day or 5,
+        "live_scan_seconds":     first.live_scan_seconds or 60,
+        "min_price":             float(first.min_price) if first.min_price is not None else 50.0,
+        "max_price":             float(first.max_price) if first.max_price is not None else 10000.0,
+        "min_volume":            first.min_volume or 500000,
+        "min_turnover_cr":       float(first.min_turnover_cr) if first.min_turnover_cr is not None else 10.0,
+        "exclude_be_series":     bool(first.exclude_be_series),
+        "risk_per_trade":        float(first.risk_per_trade) if first.risk_per_trade is not None else 400.0,
+        "entry_buffer_pct":      float(first.entry_buffer_pct) if first.entry_buffer_pct is not None else 0.004,
+        "sl_pct":                float(first.sl_pct) if first.sl_pct is not None else 0.004,
+        "entry_reference":       first.entry_reference or "close",
+        "use_first_candle":      bool(first.use_first_candle),
+        "disable_shift":         bool(first.disable_shift),
+        "gap_direction_bias":    bool(first.gap_direction_bias),
+        "boring_ratio":          float(first.boring_ratio) if first.boring_ratio is not None else 0.35,
+        "entry_missed_cancel":   bool(first.entry_missed_cancel),
+        "entry_missed_cancel_r": float(first.entry_missed_cancel_r) if first.entry_missed_cancel_r is not None else 1.5,
+        "sl_basis":              first.sl_basis or "trigger",
+        "target_r":              float(first.target_r) if first.target_r is not None else 4.0,
+        "trail_sl_steps":        trail if trail else [],
+        "tp_on_exchange":        bool(first.tp_on_exchange),
+        "tp_exchange_place_r":   float(first.tp_exchange_place_r) if first.tp_exchange_place_r is not None else 2.0,
+        "tp_exchange_cancel_r":  float(first.tp_exchange_cancel_r) if first.tp_exchange_cancel_r is not None else 1.0,
+        "reentry_mode":          first.reentry_mode or "both_sides",
+        "max_reentry_attempts":  first.max_reentry_attempts or 0,
+        "updated_at":            None,
+    }
+
+
+_ABSOLUTE_DEFAULTS = {
+    "universe_id": None, "gap_min": 3.0, "gap_max": 8.0,
+    "max_stocks_per_day": 5, "live_scan_seconds": 60,
+    "min_price": 50.0, "max_price": 10000.0, "min_volume": 500000,
+    "min_turnover_cr": 10.0, "exclude_be_series": False,
+    "risk_per_trade": 400.0, "entry_buffer_pct": 0.004, "sl_pct": 0.004,
+    "entry_reference": "close", "use_first_candle": True, "disable_shift": True,
+    "gap_direction_bias": False, "boring_ratio": 0.35,
+    "entry_missed_cancel": True, "entry_missed_cancel_r": 1.5,
+    "sl_basis": "trigger", "target_r": 4.0,
+    "trail_sl_steps": [[2.5, 0.0], [3.0, 0.5], [3.7, 2.0]],
+    "tp_on_exchange": True, "tp_exchange_place_r": 2.0, "tp_exchange_cancel_r": 1.0,
+    "reentry_mode": "both_sides", "max_reentry_attempts": 0,
+    "updated_at": None,
+}
+
+
+# ── Master config endpoints ───────────────────────────────────────────────────
+
+@router.get("/master-config")
+def get_master_config(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_master),
+):
+    """
+    Returns the single master algo config (row id=1).
+    If not yet set, bootstraps from first client's AlgoStrategy (or absolute defaults).
+    """
+    cfg = db.query(MasterAlgoConfig).filter(MasterAlgoConfig.id == 1).first()
+    if cfg:
+        return _ser_master_config(cfg)
+
+    # Bootstrap from first client strategy
+    first = db.query(AlgoStrategy).first()
+    if first:
+        return _bootstrap_from_first_strategy(first)
+
+    return dict(_ABSOLUTE_DEFAULTS)
+
+
+@router.put("/master-config")
+def put_master_config(
+    payload: dict,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_master),
+):
+    """
+    Save master algo config AND push all fields to every client's AlgoStrategy row.
+    Returns {"ok": True, "pushed_to": N} where N = number of client rows updated.
+    """
+    # Upsert the master config row (always id=1)
+    cfg = db.query(MasterAlgoConfig).filter(MasterAlgoConfig.id == 1).first()
+    if not cfg:
+        cfg = MasterAlgoConfig(id=1)
+        db.add(cfg)
+
+    for f in MASTER_FIELDS:
+        if f not in payload:
+            continue
+        val = payload[f]
+        # trail_sl_steps arrives as a list from frontend → serialize to JSON string
+        if f == "trail_sl_steps":
+            if isinstance(val, list):
+                val = json.dumps(val)
+        setattr(cfg, f, val)
+
+    db.commit()
+    db.refresh(cfg)
+
+    # Push the same values to ALL client AlgoStrategy rows
+    all_strategies = db.query(AlgoStrategy).all()
+    for strat in all_strategies:
+        for f in MASTER_FIELDS:
+            if f not in payload:
+                continue
+            val = payload[f]
+            if f == "trail_sl_steps":
+                if isinstance(val, list):
+                    val = json.dumps(val)
+            setattr(strat, f, val)
+    db.commit()
+
+    return {"ok": True, "pushed_to": len(all_strategies)}
 
 
 # ── Strategy — client self ─────────────────────────────────────────────────────
