@@ -50,10 +50,35 @@ def _get_or_create_strategy(profile_id: str, db: Session) -> AlgoStrategy:
     s = db.query(AlgoStrategy).filter(AlgoStrategy.client_profile_id == profile_id).first()
     if not s:
         s = AlgoStrategy(client_profile_id=profile_id)
+        # Seed from the live Master Config instead of bare model defaults —
+        # see _sync_from_master_if_newly_subscribed for the other half of this.
+        _copy_master_fields(s, db)
         db.add(s)
         db.commit()
         db.refresh(s)
     return s
+
+
+def _copy_master_fields(s: AlgoStrategy, db: Session) -> None:
+    """Overwrite s's MASTER_FIELDS with the current MasterAlgoConfig, if one exists."""
+    cfg = db.query(MasterAlgoConfig).filter(MasterAlgoConfig.id == 1).first()
+    if not cfg:
+        return
+    for f in MASTER_FIELDS:
+        val = getattr(cfg, f, None)
+        if val is not None:
+            setattr(s, f, val)
+
+
+def _sync_from_master_if_newly_subscribed(s: AlgoStrategy, was_active: bool, db: Session) -> None:
+    """
+    Whenever a client transitions from not-subscribed to subscribed, force their
+    strategy row to match the live Master Config first. This is what guarantees
+    "whoever subscribes gets it directly" — no need to re-click Save master config
+    every time someone subscribes, and it doesn't matter how stale their row was.
+    """
+    if s.is_active and not was_active:
+        _copy_master_fields(s, db)
 
 
 def _apply_strategy(s: AlgoStrategy, payload: AlgoStrategyRequest) -> AlgoStrategy:
@@ -333,7 +358,9 @@ def update_my_strategy(
 ):
     profile = _profile(user, db)
     s = _get_or_create_strategy(profile.id, db)
+    was_active = bool(s.is_active)
     s = _apply_strategy(s, payload)
+    _sync_from_master_if_newly_subscribed(s, was_active, db)
     db.commit()
     db.refresh(s)
     return AlgoStrategyResponse.from_orm_model(s)
@@ -522,7 +549,9 @@ def update_client_strategy(
     if not profile:
         raise HTTPException(status_code=404, detail="Client not found")
     s = _get_or_create_strategy(client_profile_id, db)
+    was_active = bool(s.is_active)
     s = _apply_strategy(s, payload)
+    _sync_from_master_if_newly_subscribed(s, was_active, db)
     db.commit()
     db.refresh(s)
     return AlgoStrategyResponse.from_orm_model(s)
