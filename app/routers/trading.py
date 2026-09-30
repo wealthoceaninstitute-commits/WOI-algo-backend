@@ -433,3 +433,23 @@ def pnl_summary(
         "running_pnl": float(row.running_pnl) if row else 0.0,
         "trade_count": row.trade_count         if row else 0,
     }
+
+
+@router.get("/master/portfolio/summary")
+def master_pnl_summary(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_master),
+):
+    """
+    Real today/closed/running P&L totals across ALL clients — for the master
+    dashboard header. Sums each client's actual DailyPnl row for today instead
+    of guessing a split of the total.
+    """
+    today = date.today()
+    rows  = db.query(DailyPnl).filter(DailyPnl.date == today).all()
+    return {
+        "today_pnl":   sum(float(r.total_pnl   or 0) for r in rows),
+        "closed_pnl":  sum(float(r.closed_pnl  or 0) for r in rows),
+        "running_pnl": sum(float(r.running_pnl or 0) for r in rows),
+        "trade_count": sum(r.trade_count or 0 for r in rows),
+    }
