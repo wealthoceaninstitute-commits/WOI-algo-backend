@@ -331,13 +331,38 @@ async def angel_fetch_first_candle(
     api_key: str,
     client_id: str,
     security_id: str,
+    max_attempts: int = 4,
+    retry_delay: float = 3.0,
 ) -> Optional[dict]:
-    """First 1-min candle of the day (9:15–9:16 AM IST)."""
-    today   = date.today()
+    """
+    First 1-min candle of the day (9:15–9:16 AM IST).
+
+    Angel One often has not published the 9:15 candle at exactly 9:16:00, and
+    the API can also return transient errors/rate limits. So retry (at least 3
+    retries = 4 attempts) with increasing delay before giving up.
+    """
+    ist     = timezone(timedelta(hours=5, minutes=30))
+    today   = datetime.now(ist).date()
     from_dt = f"{today} 09:15"
     to_dt   = f"{today} 09:17"
-    candles = await angel_fetch_candle(
-        jwt_token, api_key, client_id, security_id,
-        from_dt, to_dt,
-    )
-    return candles[0] if candles else None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            candles = await angel_fetch_candle(
+                jwt_token, api_key, client_id, security_id,
+                from_dt, to_dt,
+            )
+            if candles:
+                if attempt > 1:
+                    print(f"[angel_one] First candle for {security_id} OK on attempt {attempt}/{max_attempts}")
+                return candles[0]
+        except Exception as e:
+            print(f"[angel_one] First candle {security_id} attempt {attempt}/{max_attempts} error: {type(e).__name__}: {e}")
+
+        if attempt < max_attempts:
+            wait = retry_delay * attempt  # 3s, 6s, 9s
+            print(f"[angel_one] No candle for {security_id} (attempt {attempt}/{max_attempts}) — retrying in {wait:.0f}s")
+            await asyncio.sleep(wait)
+
+    print(f"[angel_one] No first candle for {security_id} after {max_attempts} attempts")
+    return None
