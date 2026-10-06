@@ -1070,7 +1070,7 @@ async def run_daily_algo():
                         db)
                 else:
                     stock.status = "cancelled"
-                    _log(run, f"{stock.symbol}: No candle data — skipped", db)
+                    _log(run, f"{stock.symbol}: No candle data after 4 attempts — skipped", db)
                 db.commit()
 
         # ── STEP 5: Monitor loop ────────────────────────────────────────
