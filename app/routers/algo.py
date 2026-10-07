@@ -155,6 +155,9 @@ def _ser_stock(s: AlgoStock) -> dict:
         "buy_order_id": s.buy_order_id,
         "sell_order_id": s.sell_order_id,
         "source": s.source,
+        "entry_time": s.entry_time.isoformat() if s.entry_time else None,
+        "exit_time": s.exit_time.isoformat() if s.exit_time else None,
+        "exit_reason": s.exit_reason,
     }
 
 
@@ -571,6 +574,83 @@ def get_client_runs(
         .all()
     )
     return [_ser_run(r) for r in runs]
+
+
+# ── Live positions (broker-style) ─────────────────────────────────────────────
+
+@router.get("/live")
+async def get_live_positions(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_master),
+):
+    """
+    Live view of today's master run: per-stock LTP, distance to trigger,
+    live P&L / R / effective SL / target for open positions, realised P&L
+    for closed ones. Poll every 1-2s from the UI. LTP comes from the Angel
+    WebSocket cache (REST fallback).
+    """
+    from app.services.algo_engine import position_state
+    from app.services.angel_ws import get_live_prices, is_ws_connected
+    from app.services.angel_one import angel_fetch_ltp
+
+    today = date.today()
+    run = (
+        db.query(AlgoRun)
+        .filter(AlgoRun.run_date == today)
+        .order_by(AlgoRun.created_at.asc())
+        .first()
+    )
+    if not run:
+        return {"run_status": "idle", "stocks": [], "open_pnl": 0, "closed_pnl": 0, "total_pnl": 0, "ws": False}
+
+    strategy = db.query(AlgoStrategy).filter(AlgoStrategy.client_profile_id == run.client_profile_id).first()
+    try:
+        trail_steps = json.loads(strategy.trail_sl_steps or "[]") if strategy else []
+    except Exception:
+        trail_steps = []
+
+    stocks = [s for s in (run.stocks or []) if s.status != "cancelled"]
+    active = [s for s in stocks if s.status in ("watching", "entered")]
+    sec_ids = list({str(s.security_id) for s in active})
+
+    ltp_map = get_live_prices(sec_ids) if (sec_ids and is_ws_connected()) else {}
+    if sec_ids and len(ltp_map) < len(sec_ids):
+        try:
+            from app.services.master_token import get_master_token
+            jwt, api_key, cid = await get_master_token(db)
+            rest = await angel_fetch_ltp(jwt, api_key, cid, sec_ids)
+            for k, v in (rest or {}).items():
+                ltp_map.setdefault(str(k), v)
+        except Exception as e:
+            print(f"[algo/live] REST LTP fallback failed: {e}")
+
+    rows, open_pnl, closed_pnl = [], 0.0, 0.0
+    for s in stocks:
+        ltp   = ltp_map.get(str(s.security_id))
+        row   = _ser_stock(s)
+        row["ltp"] = ltp
+        row["live"] = None
+        buy_t, sell_t = float(s.buy_trigger or 0), float(s.sell_trigger or 0)
+        if s.status == "watching" and ltp:
+            row["to_buy_pct"]  = round((buy_t - ltp) / ltp * 100, 2) if buy_t else None
+            row["to_sell_pct"] = round((ltp - sell_t) / ltp * 100, 2) if sell_t else None
+        elif s.status == "entered" and ltp and strategy:
+            st = position_state(s, ltp, strategy, trail_steps)
+            row["live"] = st or None
+            open_pnl += (st or {}).get("pnl", 0)
+        elif s.status == "exited":
+            closed_pnl += float(s.pnl or 0)
+        rows.append(row)
+
+    return {
+        "run_status": run.status,
+        "ws": is_ws_connected(),
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "stocks": rows,
+        "open_pnl": round(open_pnl, 2),
+        "closed_pnl": round(closed_pnl, 2),
+        "total_pnl": round(open_pnl + closed_pnl, 2),
+    }
 
 
 # ── Manual trigger — master can force-start algo run ─────────────────────────
