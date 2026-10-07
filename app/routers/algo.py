@@ -578,30 +578,14 @@ def get_client_runs(
 
 # ── Live positions (broker-style) ─────────────────────────────────────────────
 
-@router.get("/live")
-async def get_live_positions(
-    db: Session = Depends(get_db),
-    _: User = Depends(require_master),
-):
-    """
-    Live view of today's master run: per-stock LTP, distance to trigger,
-    live P&L / R / effective SL / target for open positions, realised P&L
-    for closed ones. Poll every 1-2s from the UI. LTP comes from the Angel
-    WebSocket cache (REST fallback).
-    """
+async def _build_live(run: Optional[AlgoRun], db: Session) -> dict:
+    """Live LTP / P&L snapshot for one run (shared by master and client views)."""
     from app.services.algo_engine import position_state
     from app.services.angel_ws import get_live_prices, is_ws_connected
     from app.services.angel_one import angel_fetch_ltp
 
-    today = date.today()
-    run = (
-        db.query(AlgoRun)
-        .filter(AlgoRun.run_date == today)
-        .order_by(AlgoRun.created_at.asc())
-        .first()
-    )
     if not run:
-        return {"run_status": "idle", "stocks": [], "open_pnl": 0, "closed_pnl": 0, "total_pnl": 0, "ws": False}
+        return {"run_status": "idle", "stocks": [], "open_pnl": 0, "closed_pnl": 0, "total_pnl": 0, "ws": is_ws_connected()}
 
     strategy = db.query(AlgoStrategy).filter(AlgoStrategy.client_profile_id == run.client_profile_id).first()
     try:
@@ -626,8 +610,8 @@ async def get_live_positions(
 
     rows, open_pnl, closed_pnl = [], 0.0, 0.0
     for s in stocks:
-        ltp   = ltp_map.get(str(s.security_id))
-        row   = _ser_stock(s)
+        ltp = ltp_map.get(str(s.security_id))
+        row = _ser_stock(s)
         row["ltp"] = ltp
         row["live"] = None
         buy_t, sell_t = float(s.buy_trigger or 0), float(s.sell_trigger or 0)
@@ -651,6 +635,37 @@ async def get_live_positions(
         "closed_pnl": round(closed_pnl, 2),
         "total_pnl": round(open_pnl + closed_pnl, 2),
     }
+
+
+@router.get("/live")
+async def get_live_positions(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_master),
+):
+    """Master view: today's earliest run (the master trade). Poll every 1-2s."""
+    run = (
+        db.query(AlgoRun)
+        .filter(AlgoRun.run_date == date.today())
+        .order_by(AlgoRun.created_at.asc())
+        .first()
+    )
+    return await _build_live(run, db)
+
+
+@router.get("/live/me")
+async def get_my_live_positions(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Client view: the logged-in client's OWN run today (their qty, their P&L)."""
+    profile = _profile(user, db)
+    run = (
+        db.query(AlgoRun)
+        .filter(AlgoRun.client_profile_id == profile.id, AlgoRun.run_date == date.today())
+        .order_by(AlgoRun.created_at.desc())
+        .first()
+    )
+    return await _build_live(run, db)
 
 
 # ── Manual trigger — master can force-start algo run ─────────────────────────
