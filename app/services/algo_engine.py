@@ -595,6 +595,52 @@ def _update_daily_pnl(profile_id: str, pnl: float, db: Session):
 
 # ── Monitor tick ──────────────────────────────────────────────────────────────
 
+# ── Live position helpers (broker-style feel) ─────────────────────────────────
+
+_last_live_log: dict[str, float] = {}   # stock.id → monotonic ts of last live log line
+LIVE_LOG_ENTERED_SECS  = 30             # open position: P&L line every 30s
+LIVE_LOG_WATCHING_SECS = 60             # waiting stock: LTP vs trigger every 60s
+
+
+def _live_log_due(key: str, every: float) -> bool:
+    import time as _t
+    now = _t.monotonic()
+    if now - _last_live_log.get(key, 0) >= every:
+        _last_live_log[key] = now
+        return True
+    return False
+
+
+def position_state(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_steps: list) -> dict:
+    """Live numbers for an open position: P&L, R multiple, effective SL, target."""
+    entry = float(stock.entry_price or 0)
+    qty   = stock.quantity or 1
+    one_r = entry * float(strategy.sl_pct)
+    if entry <= 0 or one_r <= 0:
+        return {}
+    is_buy  = stock.entry_direction == "BUY"
+    pnl     = (ltp - entry) * qty if is_buy else (entry - ltp) * qty
+    pnl_r   = ((ltp - entry) if is_buy else (entry - ltp)) / one_r
+    locked_r = -1.0
+    for step in sorted(trail_steps, key=lambda x: x[0], reverse=True):
+        if pnl_r >= step[0]:
+            locked_r = step[1]
+            break
+    sign     = 1 if is_buy else -1
+    sl_price = entry + sign * locked_r * one_r
+    target_r = float(strategy.target_r)
+    tgt      = entry + sign * target_r * one_r
+    return {
+        "pnl":       round(pnl, 2),
+        "pnl_pct":   round(pnl / (entry * qty) * 100, 2) if qty else 0,
+        "pnl_r":     round(pnl_r, 2),
+        "sl_price":  round(sl_price, 2),
+        "locked_r":  locked_r,
+        "target":    round(tgt, 2),
+    }
+
+
+
 async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
     today  = date.today()
     stocks = db.query(AlgoStock).filter(AlgoStock.status.in_(["watching", "entered"])).all()
@@ -684,11 +730,24 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
                     # Note: trigger orders fill asynchronously — actual fill price
                     # will be fetched via Dhan order status API when needed
 
+            elif _live_log_due(f"w-{stock.id}-{run.id}", LIVE_LOG_WATCHING_SECS):
+                buy_txt  = f"BUY ≥₹{buy_t:.2f} ({(buy_t - ltp) / ltp * 100:+.2f}% away)"  if buy_t  else "BUY n/a"
+                sell_txt = f"SELL ≤₹{sell_t:.2f} ({(ltp - sell_t) / ltp * 100:+.2f}% away)" if sell_t else "SELL n/a"
+                _log(run, f"WATCH {stock.symbol} LTP=₹{ltp:.2f} | {buy_txt} | {sell_txt}", db)
+
             db.commit()
             continue
 
         if stock.status == "entered" and stock.entry_price and stock.entry_direction:
             should_exit, reason = _check_exit(stock, ltp, strategy, trail_steps)
+            if not should_exit and _live_log_due(f"e-{stock.id}-{run.id}", LIVE_LOG_ENTERED_SECS):
+                st = position_state(stock, ltp, strategy, trail_steps)
+                if st:
+                    _log(run,
+                        f"LIVE {stock.entry_direction} {stock.symbol} LTP=₹{ltp:.2f} "
+                        f"| entry=₹{float(stock.entry_price):.2f} | P&L=₹{st['pnl']:+.2f} "
+                        f"({st['pnl_r']:+.2f}R) | SL=₹{st['sl_price']:.2f} | target=₹{st['target']:.2f}",
+                        db)
             if should_exit:
                 pnl               = _calc_pnl(stock, ltp)
                 entry             = float(stock.entry_price)
