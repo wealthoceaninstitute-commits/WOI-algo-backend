@@ -41,12 +41,17 @@ def get_live_ltp(security_id: str) -> Optional[float]:
     return d["ltp"] if d else None
 
 
-def get_live_prices(security_ids: list[str]) -> dict[str, float]:
-    """Get LTP for multiple stocks from in-memory store."""
+def get_live_prices(security_ids: list[str], max_age: Optional[float] = None) -> dict[str, float]:
+    """
+    Get LTP for multiple stocks from in-memory store.
+    max_age: if set, ignore prices older than this many seconds (stale-tick guard).
+    """
+    now = time.time()
     return {
         sid: _live_prices[str(sid)]["ltp"]
         for sid in security_ids
         if str(sid) in _live_prices
+        and (max_age is None or now - _live_prices[str(sid)]["timestamp"] <= max_age)
     }
 
 
