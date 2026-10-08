@@ -641,42 +641,56 @@ def position_state(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_s
 
 
 
+_last_rest_ltp_ts: float = 0.0
+
+
 async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
+    import time as _time
+    global _last_rest_ltp_ts
     today  = date.today()
     stocks = db.query(AlgoStock).filter(AlgoStock.status.in_(["watching", "entered"])).all()
     if not stocks:
         return
 
-    sec_ids = list({s.security_id for s in stocks})
+    # Open positions first — a slow entry order for one client must never delay
+    # another client's SL / target exit.
+    stocks.sort(key=lambda x: 0 if x.status == "entered" else 1)
 
-    # Use WebSocket cache if connected — no REST call needed
-    if is_ws_connected():
-        ltp_map = get_live_prices(sec_ids)
-        if not ltp_map:
-            # WebSocket not populated yet — fall back to REST
-            ltp_map = await angel_fetch_ltp(jwt, api_key, client_id, sec_ids)
-    else:
-        ltp_map = await angel_fetch_ltp(jwt, api_key, client_id, sec_ids)
+    sec_ids = list({str(s.security_id) for s in stocks})
+
+    # WebSocket cache (in-memory, instant) — REST only tops up what's missing,
+    # and at most once per 1.5s to respect Angel's rate limit.
+    ltp_map = get_live_prices(sec_ids, max_age=4) if is_ws_connected() else {}
+    missing = [sid for sid in sec_ids if sid not in ltp_map]
+    if missing and (_time.monotonic() - _last_rest_ltp_ts) >= 1.5:
+        _last_rest_ltp_ts = _time.monotonic()
+        rest = await angel_fetch_ltp(jwt, api_key, client_id, missing)
+        for k, v in (rest or {}).items():
+            ltp_map.setdefault(str(k), v)
+
+    # One query each instead of three per stock per tick
+    run_ids     = list({s.run_id for s in stocks})
+    profile_ids = list({s.client_profile_id for s in stocks})
+    runs_by_id  = {r.id: r for r in db.query(AlgoRun).filter(AlgoRun.id.in_(run_ids)).all()}
+    strat_by_pf = {x.client_profile_id: x for x in
+                   db.query(AlgoStrategy).filter(AlgoStrategy.client_profile_id.in_(profile_ids)).all()}
+    prof_by_id  = {x.id: x for x in
+                   db.query(ClientProfile).filter(ClientProfile.id.in_(profile_ids)).all()}
 
     for stock in stocks:
         ltp = ltp_map.get(str(stock.security_id))
         if not ltp:
             continue
 
-        run = db.query(AlgoRun).filter(AlgoRun.id == stock.run_id).first()
+        run = runs_by_id.get(stock.run_id)
         if not run or run.run_date != today:
             continue
 
-        strategy = db.query(AlgoStrategy).filter(
-            AlgoStrategy.client_profile_id == stock.client_profile_id
-        ).first()
+        strategy = strat_by_pf.get(stock.client_profile_id)
         if not strategy:
             continue
 
-        # Load client profile to check paper_trading flag
-        profile = db.query(ClientProfile).filter(
-            ClientProfile.id == stock.client_profile_id
-        ).first()
+        profile = prof_by_id.get(stock.client_profile_id)
         is_paper_mode = _is_paper(profile) if profile else True
 
         try:
@@ -1134,35 +1148,50 @@ async def run_daily_algo():
 
         # ── STEP 5: Monitor loop ────────────────────────────────────────
         # Single central loop — monitors all clients' positions in one pass
-        print("[algo] ─── STEP 4: MONITORING — checking LTP every 5s until 3:20 PM ───")
+        print("[algo] ─── STEP 4: MONITORING — checking LTP every 0.5s until 3:20 PM ───")
         for _, (run, _) in runs.items():
             _log_separator(run, "STEP 4: MONITORING", db)
-            _log(run, "Monitor loop started — checking LTP every 5s until 3:20 PM", db)
+            _log(run, "Monitor loop started — checking LTP every 0.5s until 3:20 PM", db)
 
         eod_ist    = datetime.now(IST).replace(hour=15, minute=20, second=0, microsecond=0)
         tick_count = 0
 
+        import time as _time
+        # Fast monitor: SL / target must trigger the moment price crosses.
+        #  • WebSocket cache is in-memory → check every 0.5s
+        #  • REST fallback is rate-limited → check every 1.5s
+        #  • Token is cached (refreshed every 2 min) — not re-read from DB per tick
+        FAST_TICK, REST_TICK, TOKEN_REFRESH_SECS = 0.5, 1.5, 120
+        last_token_ts = 0.0
+        last_hb_ts    = _time.monotonic()
+        open_count    = 1
+
         while datetime.now(IST) < eod_ist:
-            await asyncio.sleep(5)
-            tick_count += 1
+            tick_started = _time.monotonic()
+            tick_count  += 1
             try:
-                jwt, api_key, master_client_id = await _fresh_master_token()
+                if tick_started - last_token_ts > TOKEN_REFRESH_SECS:
+                    jwt, api_key, master_client_id = await _fresh_master_token()
+                    last_token_ts = tick_started
                 await _monitor_tick(db, jwt, api_key, master_client_id)
             except Exception as e:
                 import traceback as _tb
                 tb = _tb.format_exc()
                 print(f"[algo] Monitor tick error: {type(e).__name__}: {e}\n{tb}")
+                last_token_ts = 0.0   # force token refresh next tick
                 for _, (run, _) in runs.items():
                     _log(run, f"Monitor tick error: {type(e).__name__}: {e} | {tb.splitlines()[-2] if tb else ''}", db)
 
-            # Check open positions every tick — exit early when all closed
-            today_run_ids = [run.id for run, _ in runs.values()]
-            open_count = db.query(AlgoStock).filter(
-                AlgoStock.run_id.in_(today_run_ids),
-                AlgoStock.status.in_(["watching", "entered"]),
-            ).count()
+            # Check open positions every ~5s — exit early when all closed
+            if tick_count % 10 == 1:
+                today_run_ids = [run.id for run, _ in runs.values()]
+                open_count = db.query(AlgoStock).filter(
+                    AlgoStock.run_id.in_(today_run_ids),
+                    AlgoStock.status.in_(["watching", "entered"]),
+                ).count()
 
-            if tick_count % 60 == 0:
+            if _time.monotonic() - last_hb_ts >= 300:
+                last_hb_ts = _time.monotonic()
                 elapsed = (datetime.now(IST) - now_ist).seconds // 60
                 print(f"[algo] Heartbeat: {elapsed}min elapsed | {open_count} position(s) open across all clients")
                 # Log per-client open count
@@ -1178,6 +1207,10 @@ async def run_daily_algo():
                 for _, (run, _) in runs.items():
                     _log(run, "All positions closed — stopping monitor loop early", db)
                 break
+
+            # Sleep only the remainder of the interval (processing time counts)
+            interval = FAST_TICK if is_ws_connected() else REST_TICK
+            await asyncio.sleep(max(0.05, interval - (_time.monotonic() - tick_started)))
 
         # ── STEP 6: EOD force exit ──────────────────────────────────────
         for _, (run, _) in runs.items():
