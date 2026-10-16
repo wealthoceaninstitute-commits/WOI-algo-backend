@@ -536,6 +536,30 @@ async def _compute_entry(security_id: str, strategy: AlgoStrategy, jwt: str, api
 
 # ── Trail SL ──────────────────────────────────────────────────────────────────
 
+def parse_trail_steps(raw) -> list[tuple[float, float]]:
+    """
+    Normalise trail SL steps to [(trigger_R, lock_R), ...] sorted ascending.
+    Accepts a JSON string or list, with each step as [trigger, lock] OR
+    {"r_trigger": x, "lock_r": y} (the master config form saves the latter).
+    Bad entries are skipped instead of crashing the monitor loop.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw or "[]")
+        except Exception:
+            return []
+    out: list[tuple[float, float]] = []
+    for st in raw or []:
+        try:
+            if isinstance(st, dict):
+                out.append((float(st.get("r_trigger", st.get("trigger"))), float(st.get("lock_r", st.get("lock")))))
+            else:
+                out.append((float(st[0]), float(st[1])))
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: x[0])
+
+
 def _check_exit(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_steps: list) -> tuple[bool, str]:
     entry  = float(stock.entry_price or 0)
     one_r  = entry * float(strategy.sl_pct)
@@ -552,7 +576,7 @@ def _check_exit(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_step
         return True, "TARGET"
 
     locked_r = -1.0
-    for step in sorted(trail_steps, key=lambda s: s[0], reverse=True):
+    for step in parse_trail_steps(trail_steps)[::-1]:
         if pnl_r >= step[0]:
             locked_r = step[1]
             break
@@ -622,7 +646,7 @@ def position_state(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_s
     pnl     = (ltp - entry) * qty if is_buy else (entry - ltp) * qty
     pnl_r   = ((ltp - entry) if is_buy else (entry - ltp)) / one_r
     locked_r = -1.0
-    for step in sorted(trail_steps, key=lambda x: x[0], reverse=True):
+    for step in parse_trail_steps(trail_steps)[::-1]:
         if pnl_r >= step[0]:
             locked_r = step[1]
             break
@@ -693,10 +717,7 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
         profile = prof_by_id.get(stock.client_profile_id)
         is_paper_mode = _is_paper(profile) if profile else True
 
-        try:
-            trail_steps = json.loads(strategy.trail_sl_steps or "[]")
-        except Exception:
-            trail_steps = []
+        trail_steps = parse_trail_steps(strategy.trail_sl_steps)
 
         if stock.status == "watching":
             buy_t  = float(stock.buy_trigger  or 0)
