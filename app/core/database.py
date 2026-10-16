@@ -34,4 +34,11 @@ def create_tables():
         ScripMaster, StockUniverse, UniverseStock,
     )
     Base.metadata.create_all(bind=engine)
+    # Lightweight migrations for columns added after first deploy (idempotent)
+    from sqlalchemy import text
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE algo_stocks ADD COLUMN IF NOT EXISTS peak_price NUMERIC(10,2)"))
+    except Exception as e:
+        print(f"[db] migration warning: {e}")
     print("[db] All tables created/verified")
