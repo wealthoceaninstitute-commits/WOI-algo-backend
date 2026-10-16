@@ -318,6 +318,7 @@ class AlgoStock(Base):
     entry_direction   = Column(String, nullable=True)
     entry_price       = Column(Numeric(10, 2), nullable=True)
     exit_price        = Column(Numeric(10, 2), nullable=True)
+    peak_price        = Column(Numeric(10, 2), nullable=True)   # best price since entry — trailing SL ratchets off this
     quantity          = Column(Integer, nullable=True)
     pnl               = Column(Numeric(12, 2), nullable=True)
     status            = Column(String, default="watching")
