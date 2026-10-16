@@ -560,34 +560,51 @@ def parse_trail_steps(raw) -> list[tuple[float, float]]:
     return sorted(out, key=lambda x: x[0])
 
 
-def _check_exit(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_steps: list) -> tuple[bool, str]:
+def _favourable_peak(stock: AlgoStock, ltp: float) -> float:
+    """Best price reached since entry (highest for BUY, lowest for SELL)."""
+    entry  = float(stock.entry_price or 0)
+    stored = float(stock.peak_price) if getattr(stock, "peak_price", None) else entry
+    return max(stored, ltp) if stock.entry_direction == "BUY" else min(stored, ltp)
+
+
+def _trail_levels(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_steps) -> dict:
+    """
+    Trailing SL is a RATCHET: it is driven by the best price reached (peak),
+    not the current price, so once a step locks in it never moves back.
+    """
     entry  = float(stock.entry_price or 0)
     one_r  = entry * float(strategy.sl_pct)
-    target = float(strategy.target_r)
+    is_buy = stock.entry_direction == "BUY"
+    sign   = 1 if is_buy else -1
+    peak   = _favourable_peak(stock, ltp)
+    pnl_r  = sign * (ltp  - entry) / one_r
+    peak_r = sign * (peak - entry) / one_r
+    locked_r = -1.0
+    for trig, lock in parse_trail_steps(trail_steps)[::-1]:
+        if peak_r >= trig:
+            locked_r = lock
+            break
+    return {
+        "entry": entry, "one_r": one_r, "sign": sign,
+        "pnl_r": pnl_r, "peak": peak, "peak_r": peak_r, "locked_r": locked_r,
+        "sl_price": entry + sign * locked_r * one_r,
+    }
+
+
+def _check_exit(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_steps: list) -> tuple[bool, str]:
+    entry = float(stock.entry_price or 0)
+    one_r = entry * float(strategy.sl_pct)
     if one_r <= 0 or entry <= 0:
         return False, ""
 
-    pnl_r = (
-        (ltp - entry) / one_r if stock.entry_direction == "BUY"
-        else (entry - ltp)    / one_r
-    )
+    t = _trail_levels(stock, ltp, strategy, trail_steps)
 
-    if pnl_r >= target:
+    # Target: reached now OR reached at any point since entry (e.g. missed during an outage)
+    if t["peak_r"] >= float(strategy.target_r):
         return True, "TARGET"
 
-    locked_r = -1.0
-    for step in parse_trail_steps(trail_steps)[::-1]:
-        if pnl_r >= step[0]:
-            locked_r = step[1]
-            break
-
-    sl_price = (
-        entry + (locked_r * one_r) if stock.entry_direction == "BUY"
-        else entry - (locked_r * one_r)
-    )
-
-    if stock.entry_direction == "BUY"  and ltp <= sl_price: return True, "SL"
-    if stock.entry_direction == "SELL" and ltp >= sl_price: return True, "SL"
+    if stock.entry_direction == "BUY"  and ltp <= t["sl_price"]: return True, "SL"
+    if stock.entry_direction == "SELL" and ltp >= t["sl_price"]: return True, "SL"
     return False, ""
 
 
@@ -636,33 +653,24 @@ def _live_log_due(key: str, every: float) -> bool:
 
 
 def position_state(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_steps: list) -> dict:
-    """Live numbers for an open position: P&L, R multiple, effective SL, target."""
+    """Live numbers for an open position: P&L, R multiple, effective (ratcheted) SL, target."""
     entry = float(stock.entry_price or 0)
     qty   = stock.quantity or 1
     one_r = entry * float(strategy.sl_pct)
     if entry <= 0 or one_r <= 0:
         return {}
-    is_buy  = stock.entry_direction == "BUY"
-    pnl     = (ltp - entry) * qty if is_buy else (entry - ltp) * qty
-    pnl_r   = ((ltp - entry) if is_buy else (entry - ltp)) / one_r
-    locked_r = -1.0
-    for step in parse_trail_steps(trail_steps)[::-1]:
-        if pnl_r >= step[0]:
-            locked_r = step[1]
-            break
-    sign     = 1 if is_buy else -1
-    sl_price = entry + sign * locked_r * one_r
-    target_r = float(strategy.target_r)
-    tgt      = entry + sign * target_r * one_r
+    t   = _trail_levels(stock, ltp, strategy, trail_steps)
+    pnl = t["sign"] * (ltp - entry) * qty
+    tgt = entry + t["sign"] * float(strategy.target_r) * one_r
     return {
         "pnl":       round(pnl, 2),
         "pnl_pct":   round(pnl / (entry * qty) * 100, 2) if qty else 0,
-        "pnl_r":     round(pnl_r, 2),
-        "sl_price":  round(sl_price, 2),
-        "locked_r":  locked_r,
+        "pnl_r":     round(t["pnl_r"], 2),
+        "peak_r":    round(t["peak_r"], 2),
+        "sl_price":  round(t["sl_price"], 2),
+        "locked_r":  t["locked_r"],
         "target":    round(tgt, 2),
     }
-
 
 
 _last_rest_ltp_ts: float = 0.0
@@ -740,6 +748,7 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
                 stock.entry_direction = direction
                 stock.status          = "entered"
                 stock.entry_price     = ltp
+                stock.peak_price      = ltp
                 stock.entry_time      = datetime.now(timezone.utc)
                 run.stocks_traded     = (run.stocks_traded or 0) + 1
                 trig      = buy_t if direction == "BUY" else sell_t
@@ -774,6 +783,10 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
             continue
 
         if stock.status == "entered" and stock.entry_price and stock.entry_direction:
+            # Ratchet: remember the best price so the trailing SL can never move back
+            new_peak = _favourable_peak(stock, ltp)
+            if stock.peak_price is None or float(stock.peak_price) != new_peak:
+                stock.peak_price = new_peak
             should_exit, reason = _check_exit(stock, ltp, strategy, trail_steps)
             if not should_exit and _live_log_due(f"e-{stock.id}-{run.id}", LIVE_LOG_ENTERED_SECS):
                 st = position_state(stock, ltp, strategy, trail_steps)
@@ -917,6 +930,172 @@ async def _keep_token_alive_until(
 
 # Guard against double-runs
 _algo_running = False
+
+
+async def _monitor_and_finish(db: Session, runs: dict, jwt: str, api_key: str,
+                              master_client_id: str, now_ist: datetime):
+    """
+    Monitor loop (every 0.5s until 3:20 PM) → EOD force exit → run summary.
+    Shared by the normal daily run and by resume-after-restart.
+    runs = { client_profile_id: (AlgoRun, AlgoStrategy) }
+    """
+    # ── STEP 5: Monitor loop ────────────────────────────────────────
+    # Single central loop — monitors all clients' positions in one pass
+    print("[algo] ─── STEP 4: MONITORING — checking LTP every 0.5s until 3:20 PM ───")
+    for _, (run, _) in runs.items():
+        _log_separator(run, "STEP 4: MONITORING", db)
+        _log(run, "Monitor loop started — checking LTP every 0.5s until 3:20 PM", db)
+
+    eod_ist    = datetime.now(IST).replace(hour=15, minute=20, second=0, microsecond=0)
+    tick_count = 0
+
+    import time as _time
+    # Fast monitor: SL / target must trigger the moment price crosses.
+    #  • WebSocket cache is in-memory → check every 0.5s
+    #  • REST fallback is rate-limited → check every 1.5s
+    #  • Token is cached (refreshed every 2 min) — not re-read from DB per tick
+    FAST_TICK, REST_TICK, TOKEN_REFRESH_SECS = 0.5, 1.5, 120
+    last_token_ts = 0.0
+    last_hb_ts    = _time.monotonic()
+    open_count    = 1
+
+    while datetime.now(IST) < eod_ist:
+        tick_started = _time.monotonic()
+        tick_count  += 1
+        try:
+            if tick_started - last_token_ts > TOKEN_REFRESH_SECS:
+                jwt, api_key, master_client_id = await _fresh_master_token()
+                last_token_ts = tick_started
+            await _monitor_tick(db, jwt, api_key, master_client_id)
+        except Exception as e:
+            import traceback as _tb
+            tb = _tb.format_exc()
+            print(f"[algo] Monitor tick error: {type(e).__name__}: {e}\n{tb}")
+            last_token_ts = 0.0   # force token refresh next tick
+            for _, (run, _) in runs.items():
+                _log(run, f"Monitor tick error: {type(e).__name__}: {e} | {tb.splitlines()[-2] if tb else ''}", db)
+
+        # Check open positions every ~5s — exit early when all closed
+        if tick_count % 10 == 1:
+            today_run_ids = [run.id for run, _ in runs.values()]
+            open_count = db.query(AlgoStock).filter(
+                AlgoStock.run_id.in_(today_run_ids),
+                AlgoStock.status.in_(["watching", "entered"]),
+            ).count()
+
+        if _time.monotonic() - last_hb_ts >= 300:
+            last_hb_ts = _time.monotonic()
+            elapsed = (datetime.now(IST) - now_ist).seconds // 60
+            print(f"[algo] Heartbeat: {elapsed}min elapsed | {open_count} position(s) open across all clients")
+            # Log per-client open count
+            for pid, (run, _) in runs.items():
+                client_open = db.query(AlgoStock).filter(
+                    AlgoStock.run_id == run.id,
+                    AlgoStock.status.in_(["watching", "entered"]),
+                ).count()
+                _log(run, f"Heartbeat: {elapsed}min elapsed | {client_open} position(s) open", db)
+
+        if open_count == 0:
+            print("[algo] All positions closed across all clients — stopping monitor loop")
+            for _, (run, _) in runs.items():
+                _log(run, "All positions closed — stopping monitor loop early", db)
+            break
+
+        # Sleep only the remainder of the interval (processing time counts)
+        interval = FAST_TICK if is_ws_connected() else REST_TICK
+        await asyncio.sleep(max(0.05, interval - (_time.monotonic() - tick_started)))
+
+    # ── STEP 6: EOD force exit ──────────────────────────────────────
+    for _, (run, _) in runs.items():
+        _log_separator(run, "STEP 5: EOD FORCE EXIT (3:20 PM)", db)
+
+    jwt, api_key, master_client_id = await _fresh_master_token()
+    await _force_exit_all(db, jwt, api_key, master_client_id)
+
+    # Final summary
+    for _pid, (run, _s) in runs.items():
+        run.status      = "done"
+        run.finished_at = datetime.now(timezone.utc)
+        _log_separator(run, "RUN COMPLETE", db)
+        _log(run, f"Total P&L: ₹{float(run.total_pnl or 0):.2f}", db)
+        _log(run, f"Stocks: scanned={run.stocks_scanned} | selected={run.stocks_selected} | traded={run.stocks_traded}", db)
+        winners = db.query(AlgoStock).filter(
+            AlgoStock.run_id == run.id, AlgoStock.status == "exited", AlgoStock.pnl > 0
+        ).count()
+        losers = db.query(AlgoStock).filter(
+            AlgoStock.run_id == run.id, AlgoStock.status == "exited", AlgoStock.pnl <= 0
+        ).count()
+        _log(run,
+            f"Trades: {winners} winners | {losers} losers | "
+            f"Win rate: {round(winners/(winners+losers)*100,1) if (winners+losers) > 0 else 0}%", db)
+
+
+
+async def resume_monitoring_if_needed():
+    """
+    Called at server start. If the server restarted (deploy / crash) while today's
+    run was monitoring, nothing would be watching open positions any more — their
+    SL / target / trailing would silently stop. Pick them back up from the DB.
+    """
+    global _algo_running
+    if _algo_running:
+        return
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return
+
+    db = SessionLocal()
+    took_lock = False
+    try:
+        today = date.today()
+        run_rows = db.query(AlgoRun).filter(
+            AlgoRun.run_date == today, AlgoRun.status == "running"
+        ).all()
+        if not run_rows:
+            return
+
+        runs, sec_ids = {}, set()
+        for r in run_rows:
+            strat = db.query(AlgoStrategy).filter(
+                AlgoStrategy.client_profile_id == r.client_profile_id
+            ).first()
+            if not strat:
+                continue
+            runs[r.client_profile_id] = (r, strat)
+            for st in db.query(AlgoStock).filter(
+                AlgoStock.run_id == r.id, AlgoStock.status.in_(["watching", "entered"])
+            ).all():
+                sec_ids.add(str(st.security_id))
+        if not runs:
+            return
+
+        if _algo_running:
+            return
+        _algo_running = True
+        took_lock = True
+
+        print(f"[algo] RESUME after restart — {len(sec_ids)} open/watching stock(s), {len(runs)} run(s)")
+        jwt, api_key, master_client_id = await _fresh_master_token()
+
+        from app.models.master_account import MasterDataAccount
+        acc = db.query(MasterDataAccount).first()
+        feed_token = acc.angel_feed_token if acc and acc.angel_feed_token else ""
+        if feed_token and sec_ids:
+            await ensure_ws_running(jwt, feed_token, master_client_id, list(sec_ids))
+            print(f"[algo] WebSocket (resume): {ws_stats()}")
+
+        for _pid, (run, _s) in runs.items():
+            _log_separator(run, "RESUMED AFTER SERVER RESTART", db)
+            _log(run, "Server restarted mid-session — monitoring resumed for open positions", db)
+
+        await _monitor_and_finish(db, runs, jwt, api_key, master_client_id, now)
+    except Exception as e:
+        print(f"[algo] Resume error: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        if took_lock:
+            _algo_running = False
+        db.close()
 
 
 async def run_daily_algo():
@@ -1167,96 +1346,7 @@ async def run_daily_algo():
                     _log(run, f"{stock.symbol}: No candle data after 4 attempts — skipped", db)
                 db.commit()
 
-        # ── STEP 5: Monitor loop ────────────────────────────────────────
-        # Single central loop — monitors all clients' positions in one pass
-        print("[algo] ─── STEP 4: MONITORING — checking LTP every 0.5s until 3:20 PM ───")
-        for _, (run, _) in runs.items():
-            _log_separator(run, "STEP 4: MONITORING", db)
-            _log(run, "Monitor loop started — checking LTP every 0.5s until 3:20 PM", db)
-
-        eod_ist    = datetime.now(IST).replace(hour=15, minute=20, second=0, microsecond=0)
-        tick_count = 0
-
-        import time as _time
-        # Fast monitor: SL / target must trigger the moment price crosses.
-        #  • WebSocket cache is in-memory → check every 0.5s
-        #  • REST fallback is rate-limited → check every 1.5s
-        #  • Token is cached (refreshed every 2 min) — not re-read from DB per tick
-        FAST_TICK, REST_TICK, TOKEN_REFRESH_SECS = 0.5, 1.5, 120
-        last_token_ts = 0.0
-        last_hb_ts    = _time.monotonic()
-        open_count    = 1
-
-        while datetime.now(IST) < eod_ist:
-            tick_started = _time.monotonic()
-            tick_count  += 1
-            try:
-                if tick_started - last_token_ts > TOKEN_REFRESH_SECS:
-                    jwt, api_key, master_client_id = await _fresh_master_token()
-                    last_token_ts = tick_started
-                await _monitor_tick(db, jwt, api_key, master_client_id)
-            except Exception as e:
-                import traceback as _tb
-                tb = _tb.format_exc()
-                print(f"[algo] Monitor tick error: {type(e).__name__}: {e}\n{tb}")
-                last_token_ts = 0.0   # force token refresh next tick
-                for _, (run, _) in runs.items():
-                    _log(run, f"Monitor tick error: {type(e).__name__}: {e} | {tb.splitlines()[-2] if tb else ''}", db)
-
-            # Check open positions every ~5s — exit early when all closed
-            if tick_count % 10 == 1:
-                today_run_ids = [run.id for run, _ in runs.values()]
-                open_count = db.query(AlgoStock).filter(
-                    AlgoStock.run_id.in_(today_run_ids),
-                    AlgoStock.status.in_(["watching", "entered"]),
-                ).count()
-
-            if _time.monotonic() - last_hb_ts >= 300:
-                last_hb_ts = _time.monotonic()
-                elapsed = (datetime.now(IST) - now_ist).seconds // 60
-                print(f"[algo] Heartbeat: {elapsed}min elapsed | {open_count} position(s) open across all clients")
-                # Log per-client open count
-                for pid, (run, _) in runs.items():
-                    client_open = db.query(AlgoStock).filter(
-                        AlgoStock.run_id == run.id,
-                        AlgoStock.status.in_(["watching", "entered"]),
-                    ).count()
-                    _log(run, f"Heartbeat: {elapsed}min elapsed | {client_open} position(s) open", db)
-
-            if open_count == 0:
-                print("[algo] All positions closed across all clients — stopping monitor loop")
-                for _, (run, _) in runs.items():
-                    _log(run, "All positions closed — stopping monitor loop early", db)
-                break
-
-            # Sleep only the remainder of the interval (processing time counts)
-            interval = FAST_TICK if is_ws_connected() else REST_TICK
-            await asyncio.sleep(max(0.05, interval - (_time.monotonic() - tick_started)))
-
-        # ── STEP 6: EOD force exit ──────────────────────────────────────
-        for _, (run, _) in runs.items():
-            _log_separator(run, "STEP 5: EOD FORCE EXIT (3:20 PM)", db)
-
-        jwt, api_key, master_client_id = await _fresh_master_token()
-        await _force_exit_all(db, jwt, api_key, master_client_id)
-
-        # Final summary
-        for profile, _ in clients:
-            run, _ = runs[profile.id]
-            run.status      = "done"
-            run.finished_at = datetime.now(timezone.utc)
-            _log_separator(run, "RUN COMPLETE", db)
-            _log(run, f"Total P&L: ₹{float(run.total_pnl or 0):.2f}", db)
-            _log(run, f"Stocks: scanned={run.stocks_scanned} | selected={run.stocks_selected} | traded={run.stocks_traded}", db)
-            winners = db.query(AlgoStock).filter(
-                AlgoStock.run_id == run.id, AlgoStock.status == "exited", AlgoStock.pnl > 0
-            ).count()
-            losers = db.query(AlgoStock).filter(
-                AlgoStock.run_id == run.id, AlgoStock.status == "exited", AlgoStock.pnl <= 0
-            ).count()
-            _log(run,
-                f"Trades: {winners} winners | {losers} losers | "
-                f"Win rate: {round(winners/(winners+losers)*100,1) if (winners+losers) > 0 else 0}%", db)
+        await _monitor_and_finish(db, runs, jwt, api_key, master_client_id, now_ist)
 
         print("[algo] ═══ Daily run complete ═══")
 
