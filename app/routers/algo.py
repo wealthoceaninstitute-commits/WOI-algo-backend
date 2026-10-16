@@ -173,6 +173,12 @@ MASTER_FIELDS = [
 ]
 
 
+def _trail_objs(trail) -> list[dict]:
+    """Trail steps as [{r_trigger, lock_r}] — the shape the master config form edits."""
+    from app.services.algo_engine import parse_trail_steps
+    return [{"r_trigger": a, "lock_r": b} for a, b in parse_trail_steps(trail)]
+
+
 def _ser_master_config(cfg: MasterAlgoConfig) -> dict:
     """Serialize MasterAlgoConfig row to dict for frontend."""
     trail = cfg.trail_sl_steps
@@ -205,7 +211,7 @@ def _ser_master_config(cfg: MasterAlgoConfig) -> dict:
         "entry_missed_cancel_r": float(cfg.entry_missed_cancel_r) if cfg.entry_missed_cancel_r is not None else 1.5,
         "sl_basis":              cfg.sl_basis or "trigger",
         "target_r":              float(cfg.target_r) if cfg.target_r is not None else 4.0,
-        "trail_sl_steps":        trail if trail else [],
+        "trail_sl_steps":        _trail_objs(trail),
         "tp_on_exchange":        bool(cfg.tp_on_exchange),
         "tp_exchange_place_r":   float(cfg.tp_exchange_place_r) if cfg.tp_exchange_place_r is not None else 2.0,
         "tp_exchange_cancel_r":  float(cfg.tp_exchange_cancel_r) if cfg.tp_exchange_cancel_r is not None else 1.0,
@@ -246,7 +252,7 @@ def _bootstrap_from_first_strategy(first: AlgoStrategy) -> dict:
         "entry_missed_cancel_r": float(first.entry_missed_cancel_r) if first.entry_missed_cancel_r is not None else 1.5,
         "sl_basis":              first.sl_basis or "trigger",
         "target_r":              float(first.target_r) if first.target_r is not None else 4.0,
-        "trail_sl_steps":        trail if trail else [],
+        "trail_sl_steps":        _trail_objs(trail),
         "tp_on_exchange":        bool(first.tp_on_exchange),
         "tp_exchange_place_r":   float(first.tp_exchange_place_r) if first.tp_exchange_place_r is not None else 2.0,
         "tp_exchange_cancel_r":  float(first.tp_exchange_cancel_r) if first.tp_exchange_cancel_r is not None else 1.0,
@@ -319,7 +325,8 @@ def put_master_config(
         # trail_sl_steps arrives as a list from frontend → serialize to JSON string
         if f == "trail_sl_steps":
             if isinstance(val, list):
-                val = json.dumps(val)
+                from app.services.algo_engine import parse_trail_steps
+                val = json.dumps([list(t) for t in parse_trail_steps(val)])
         setattr(cfg, f, val)
 
     db.commit()
@@ -334,7 +341,8 @@ def put_master_config(
             val = payload[f]
             if f == "trail_sl_steps":
                 if isinstance(val, list):
-                    val = json.dumps(val)
+                    from app.services.algo_engine import parse_trail_steps
+                    val = json.dumps([list(t) for t in parse_trail_steps(val)])
             setattr(strat, f, val)
     db.commit()
 
@@ -588,10 +596,8 @@ async def _build_live(run: Optional[AlgoRun], db: Session) -> dict:
         return {"run_status": "idle", "stocks": [], "open_pnl": 0, "closed_pnl": 0, "total_pnl": 0, "ws": is_ws_connected()}
 
     strategy = db.query(AlgoStrategy).filter(AlgoStrategy.client_profile_id == run.client_profile_id).first()
-    try:
-        trail_steps = json.loads(strategy.trail_sl_steps or "[]") if strategy else []
-    except Exception:
-        trail_steps = []
+    from app.services.algo_engine import parse_trail_steps
+    trail_steps = parse_trail_steps(strategy.trail_sl_steps) if strategy else []
 
     stocks = [s for s in (run.stocks or []) if s.status != "cancelled"]
     active = [s for s in stocks if s.status in ("watching", "entered")]
