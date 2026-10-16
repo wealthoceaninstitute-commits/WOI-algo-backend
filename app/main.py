@@ -111,15 +111,23 @@ async def lifespan(app: FastAPI):
     create_master_if_needed()
 
     task = asyncio.create_task(morning_scheduler())
+
+    # If we restarted mid-session, resume watching open positions (SL / target / trail)
+    async def _resume_after_boot():
+        await asyncio.sleep(5)
+        from app.services.algo_engine import resume_monitoring_if_needed
+        await resume_monitoring_if_needed()
+    resume_task = asyncio.create_task(_resume_after_boot())
     print("[startup] Morning scheduler started (8AM cleanup+scrip+tokens, 8:45AM algo)")
 
     yield
 
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    for t in (task, resume_task):
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
