@@ -78,8 +78,8 @@ class AlgoStrategyResponse(AlgoStrategyRequest):
     def from_orm_model(cls, m):
         steps = []
         try:
-            raw = json.loads(m.trail_sl_steps or "[]")
-            steps = [TrailStep(r_trigger=s[0], lock_r=s[1]) for s in raw]
+            from app.services.algo_engine import parse_trail_steps
+            steps = [TrailStep(r_trigger=a, lock_r=b) for a, b in parse_trail_steps(m.trail_sl_steps)]
         except Exception:
             steps = []
 
