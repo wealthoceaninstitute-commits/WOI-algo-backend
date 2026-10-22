@@ -16,7 +16,7 @@ Benefits:
   - Debug endpoint: GET /api/algo/debug/snapshot?date=YYYY-MM-DD
 """
 
-import asyncio, json
+import asyncio, json, math
 from datetime import datetime, date, timezone, timedelta
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -519,8 +519,9 @@ async def _compute_entry(security_id: str, strategy: AlgoStrategy, jwt: str, api
     base_buy  = candle["close"] if strategy.entry_reference == "close" else candle["high"]
     base_sell = candle["close"] if strategy.entry_reference == "close" else candle["low"]
 
-    buy_trigger  = round(base_buy  * (1 + buf), 2)
-    sell_trigger = round(base_sell * (1 - buf), 2)
+    tick         = _tick_for(security_id)
+    buy_trigger  = snap_to_tick(base_buy  * (1 + buf), tick, "up")     # BUY only at/above the level
+    sell_trigger = snap_to_tick(base_sell * (1 - buf), tick, "down")   # SELL only at/below the level
     rps          = buy_trigger * sl
     quantity     = max(1, int(risk / rps)) if rps > 0 else 1
 
@@ -533,6 +534,56 @@ async def _compute_entry(security_id: str, strategy: AlgoStrategy, jwt: str, api
         "sell_trigger": sell_trigger,
         "quantity":     quantity,
     }
+
+
+# ── NSE tick size ─────────────────────────────────────────────────────────────
+# Every price sent to / compared against the exchange must sit on the instrument's
+# tick (₹0.05 for most NSE equities, ₹0.01 for ETFs etc.). Taken from scrip_master.
+
+DEFAULT_TICK = 0.05
+_tick_cache: dict[str, float] = {}
+_tick_loaded_at: float = 0.0
+
+
+def _norm_tick(raw) -> float:
+    try:
+        t = float(raw)
+    except Exception:
+        return DEFAULT_TICK
+    if t <= 0:
+        return DEFAULT_TICK
+    if t >= 1:          # some feeds give the tick in paise (5 = ₹0.05)
+        t = t / 100.0
+    return round(t, 4)
+
+
+def _tick_for(security_id) -> float:
+    """Tick size for a security (cached; scrip_master reloaded at most every 30 min on a miss)."""
+    import time as _t
+    global _tick_loaded_at
+    sid = str(security_id)
+    if sid in _tick_cache:
+        return _tick_cache[sid]
+    if not _tick_cache or _t.monotonic() - _tick_loaded_at > 1800:
+        _tick_loaded_at = _t.monotonic()
+        sdb = SessionLocal()
+        try:
+            for k, v in sdb.query(ScripMaster.security_id, ScripMaster.tick_size).all():
+                _tick_cache[str(k)] = _norm_tick(v)
+        except Exception as e:
+            print(f"[algo] tick-size load failed: {e}")
+        finally:
+            sdb.close()
+    return _tick_cache.get(sid, DEFAULT_TICK)
+
+
+def snap_to_tick(price: float, tick: float, mode: str = "nearest") -> float:
+    """Snap a price to the tick grid. mode: 'up' (ceil), 'down' (floor) or 'nearest'."""
+    if not tick or tick <= 0:
+        return round(price, 2)
+    q = price / tick
+    n = math.ceil(q - 1e-6) if mode == "up" else math.floor(q + 1e-6) if mode == "down" else round(q)
+    return round(n * tick, 4)
 
 
 # ── Trail SL ──────────────────────────────────────────────────────────────────
@@ -588,7 +639,9 @@ def _trail_levels(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_st
     return {
         "entry": entry, "one_r": one_r, "sign": sign,
         "pnl_r": pnl_r, "peak": peak, "peak_r": peak_r, "locked_r": locked_r,
-        "sl_price": entry + sign * locked_r * one_r,
+        # SL rounds toward the market (BUY up / SELL down): protective, never riskier than planned
+        "sl_price": snap_to_tick(entry + sign * locked_r * one_r, _tick_for(stock.security_id),
+                                 "up" if is_buy else "down"),
     }
 
 
@@ -600,8 +653,11 @@ def _check_exit(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_step
 
     t = _trail_levels(stock, ltp, strategy, trail_steps)
 
-    # Target: reached now OR reached at any point since entry (e.g. missed during an outage)
-    if t["peak_r"] >= float(strategy.target_r):
+    # Target: reached now OR reached at any point since entry (e.g. missed during an outage).
+    # Compared on the tick-snapped target PRICE (an R-multiple check would miss it after rounding).
+    tgt = _target_price(stock, strategy)
+    if (stock.entry_direction == "BUY" and t["peak"] >= tgt) or \
+       (stock.entry_direction == "SELL" and t["peak"] <= tgt):
         return True, "TARGET"
 
     if stock.entry_direction == "BUY"  and ltp <= t["sl_price"]: return True, "SL"
@@ -612,8 +668,11 @@ def _check_exit(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_step
 def _target_price(stock: AlgoStock, strategy: AlgoStrategy) -> float:
     entry = float(stock.entry_price or 0)
     one_r = entry * float(strategy.sl_pct)
-    sign  = 1 if stock.entry_direction == "BUY" else -1
-    return round(entry + sign * float(strategy.target_r) * one_r, 2)
+    is_buy = stock.entry_direction == "BUY"
+    sign  = 1 if is_buy else -1
+    # Target rounds toward entry (BUY down / SELL up) so the limit level is always tradable
+    return snap_to_tick(entry + sign * float(strategy.target_r) * one_r,
+                        _tick_for(stock.security_id), "down" if is_buy else "up")
 
 
 def _calc_pnl(stock: AlgoStock, exit_price: float) -> float:
@@ -669,7 +728,7 @@ def position_state(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_s
         return {}
     t   = _trail_levels(stock, ltp, strategy, trail_steps)
     pnl = t["sign"] * (ltp - entry) * qty
-    tgt = entry + t["sign"] * float(strategy.target_r) * one_r
+    tgt = _target_price(stock, strategy)
     return {
         "pnl":       round(pnl, 2),
         "pnl_pct":   round(pnl / (entry * qty) * 100, 2) if qty else 0,
@@ -760,11 +819,8 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
                 stock.entry_time      = datetime.now(timezone.utc)
                 run.stocks_traded     = (run.stocks_traded or 0) + 1
                 trig      = buy_t if direction == "BUY" else sell_t
-                sl_price  = ltp * (1 - float(strategy.sl_pct)) if direction == "BUY" \
-                            else ltp * (1 + float(strategy.sl_pct))
-                tgt_price = ltp * (1 + float(strategy.sl_pct) * float(strategy.target_r)) \
-                            if direction == "BUY" \
-                            else ltp * (1 - float(strategy.sl_pct) * float(strategy.target_r))
+                sl_price  = _trail_levels(stock, ltp, strategy, trail_steps)["sl_price"]
+                tgt_price = _target_price(stock, strategy)
                 mode_label = "PAPER" if is_paper_mode else "LIVE"
                 _log(run,
                     f"{mode_label} {direction} {stock.symbol} @ ₹{ltp:.2f} "
