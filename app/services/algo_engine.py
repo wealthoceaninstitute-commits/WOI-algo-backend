@@ -519,7 +519,7 @@ async def _compute_entry(security_id: str, strategy: AlgoStrategy, jwt: str, api
     base_buy  = candle["close"] if strategy.entry_reference == "close" else candle["high"]
     base_sell = candle["close"] if strategy.entry_reference == "close" else candle["low"]
 
-    tick         = _tick_for(security_id)
+    tick         = _tick_for(security_id, base_buy)
     buy_trigger  = snap_to_tick(base_buy  * (1 + buf), tick, "up")     # BUY only at/above the level
     sell_trigger = snap_to_tick(base_sell * (1 - buf), tick, "down")   # SELL only at/below the level
     rps          = buy_trigger * sl
@@ -537,12 +537,28 @@ async def _compute_entry(security_id: str, strategy: AlgoStrategy, jwt: str, api
 
 
 # ── NSE tick size ─────────────────────────────────────────────────────────────
-# Every price sent to / compared against the exchange must sit on the instrument's
-# tick (₹0.05 for most NSE equities, ₹0.01 for ETFs etc.). Taken from scrip_master.
+# Every price compared against / sent to the exchange must sit on the instrument's tick.
+# NSE circular CMTR67133 (effective 15-Apr-2025): cash-segment tick depends on the
+# security's price band (excluding ETFs), reviewed monthly:
+#   < ₹250 → 0.01 | 250–1,000 → 0.05 | >1,000–5,000 → 0.10 | >5,000–10,000 → 0.50
+#   >10,000–20,000 → 1.00 | >20,000 → 5.00
+# Rule used here: tick = max(tick listed in scrip_master, tick of the price band),
+# ETFs use the listed tick only. A coarser grid is always valid on a finer one, so the
+# max can never produce an off-tick price even if one of the two sources is stale.
 
 DEFAULT_TICK = 0.05
-_tick_cache: dict[str, float] = {}
+_tick_cache: dict[str, tuple[float, bool]] = {}   # security_id → (listed tick, is_etf)
 _tick_loaded_at: float = 0.0
+
+
+def band_tick(price: float) -> float:
+    if price <= 0:      return DEFAULT_TICK
+    if price < 250:     return 0.01
+    if price <= 1000:   return 0.05
+    if price <= 5000:   return 0.10
+    if price <= 10000:  return 0.50
+    if price <= 20000:  return 1.00
+    return 5.00
 
 
 def _norm_tick(raw) -> float:
@@ -557,24 +573,31 @@ def _norm_tick(raw) -> float:
     return round(t, 4)
 
 
-def _tick_for(security_id) -> float:
-    """Tick size for a security (cached; scrip_master reloaded at most every 30 min on a miss)."""
+def _tick_for(security_id, ref_price: Optional[float] = None) -> float:
+    """
+    Tick size for a security at a reference price (entry / trigger price).
+    scrip_master is reloaded at most every 30 min on a cache miss.
+    """
     import time as _t
     global _tick_loaded_at
     sid = str(security_id)
-    if sid in _tick_cache:
-        return _tick_cache[sid]
-    if not _tick_cache or _t.monotonic() - _tick_loaded_at > 1800:
+    if sid not in _tick_cache and (not _tick_cache or _t.monotonic() - _tick_loaded_at > 1800):
         _tick_loaded_at = _t.monotonic()
         sdb = SessionLocal()
         try:
-            for k, v in sdb.query(ScripMaster.security_id, ScripMaster.tick_size).all():
-                _tick_cache[str(k)] = _norm_tick(v)
+            for k, v, nm, sy in sdb.query(
+                ScripMaster.security_id, ScripMaster.tick_size, ScripMaster.name, ScripMaster.symbol
+            ).all():
+                label = f"{nm or ''} {sy or ''}".upper()
+                _tick_cache[str(k)] = (_norm_tick(v), "ETF" in label or "BEES" in label)
         except Exception as e:
             print(f"[algo] tick-size load failed: {e}")
         finally:
             sdb.close()
-    return _tick_cache.get(sid, DEFAULT_TICK)
+    listed, is_etf = _tick_cache.get(sid, (DEFAULT_TICK, False))
+    if ref_price and not is_etf:
+        return max(listed, band_tick(float(ref_price)))
+    return listed
 
 
 def snap_to_tick(price: float, tick: float, mode: str = "nearest") -> float:
@@ -640,7 +663,7 @@ def _trail_levels(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_st
         "entry": entry, "one_r": one_r, "sign": sign,
         "pnl_r": pnl_r, "peak": peak, "peak_r": peak_r, "locked_r": locked_r,
         # SL rounds toward the market (BUY up / SELL down): protective, never riskier than planned
-        "sl_price": snap_to_tick(entry + sign * locked_r * one_r, _tick_for(stock.security_id),
+        "sl_price": snap_to_tick(entry + sign * locked_r * one_r, _tick_for(stock.security_id, entry),
                                  "up" if is_buy else "down"),
     }
 
@@ -672,7 +695,7 @@ def _target_price(stock: AlgoStock, strategy: AlgoStrategy) -> float:
     sign  = 1 if is_buy else -1
     # Target rounds toward entry (BUY down / SELL up) so the limit level is always tradable
     return snap_to_tick(entry + sign * float(strategy.target_r) * one_r,
-                        _tick_for(stock.security_id), "down" if is_buy else "up")
+                        _tick_for(stock.security_id, entry), "down" if is_buy else "up")
 
 
 def _calc_pnl(stock: AlgoStock, exit_price: float) -> float:
