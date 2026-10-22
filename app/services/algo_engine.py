@@ -165,11 +165,12 @@ FALLBACK_UNIVERSE = [
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
-def _log(run: AlgoRun, msg: str, db: Session):
+def _log(run: AlgoRun, msg: str, db: Session, commit: bool = True):
     ts      = datetime.now(IST).strftime("%H:%M:%S")
     line    = f"[{ts}] {msg}"
     run.log = (run.log or "") + line + "\n"
-    db.commit()
+    if commit:
+        db.commit()
     print(f"[algo] {msg}")
 
 
@@ -608,6 +609,13 @@ def _check_exit(stock: AlgoStock, ltp: float, strategy: AlgoStrategy, trail_step
     return False, ""
 
 
+def _target_price(stock: AlgoStock, strategy: AlgoStrategy) -> float:
+    entry = float(stock.entry_price or 0)
+    one_r = entry * float(strategy.sl_pct)
+    sign  = 1 if stock.entry_direction == "BUY" else -1
+    return round(entry + sign * float(strategy.target_r) * one_r, 2)
+
+
 def _calc_pnl(stock: AlgoStock, exit_price: float) -> float:
     qty   = stock.quantity or 1
     entry = float(stock.entry_price or 0)
@@ -777,9 +785,10 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
             elif _live_log_due(f"w-{stock.id}-{run.id}", LIVE_LOG_WATCHING_SECS):
                 buy_txt  = f"BUY ≥₹{buy_t:.2f} ({(buy_t - ltp) / ltp * 100:+.2f}% away)"  if buy_t  else "BUY n/a"
                 sell_txt = f"SELL ≤₹{sell_t:.2f} ({(ltp - sell_t) / ltp * 100:+.2f}% away)" if sell_t else "SELL n/a"
-                _log(run, f"WATCH {stock.symbol} LTP=₹{ltp:.2f} | {buy_txt} | {sell_txt}", db)
+                _log(run, f"WATCH {stock.symbol} LTP=₹{ltp:.2f} | {buy_txt} | {sell_txt}", db, commit=False)
 
-            db.commit()
+            if entered:
+                db.commit()
             continue
 
         if stock.status == "entered" and stock.entry_price and stock.entry_direction:
@@ -795,20 +804,28 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
                         f"LIVE {stock.entry_direction} {stock.symbol} LTP=₹{ltp:.2f} "
                         f"| entry=₹{float(stock.entry_price):.2f} | P&L=₹{st['pnl']:+.2f} "
                         f"({st['pnl_r']:+.2f}R) | SL=₹{st['sl_price']:.2f} | target=₹{st['target']:.2f}",
-                        db)
+                        db, commit=False)
             if should_exit:
-                pnl               = _calc_pnl(stock, ltp)
+                # TARGET behaves like a resting limit order: it fills AT the target
+                # price even if our tick only sees the price after it ran past it.
+                # SL is a stop-market: fills at the prevailing LTP (real slippage).
+                # LIVE clients get a market order, so the recorded price stays LTP.
+                fill = ltp
+                if reason == "TARGET" and is_paper_mode:
+                    fill = _target_price(stock, strategy)
+                pnl               = _calc_pnl(stock, fill)
                 entry             = float(stock.entry_price)
                 one_r             = entry * float(strategy.sl_pct)
                 rr                = round(pnl / (one_r * (stock.quantity or 1)), 2) if one_r > 0 else 0
                 stock.status      = "exited"
-                stock.exit_price  = ltp
+                stock.exit_price  = fill
                 stock.exit_time   = datetime.now(timezone.utc)
                 stock.exit_reason = reason
                 stock.pnl         = pnl
                 run.total_pnl     = float(run.total_pnl or 0) + pnl
+                seen = f" (LTP seen ₹{ltp:.2f})" if fill != ltp else ""
                 _log(run,
-                    f"EXIT {stock.symbol} [{reason}] @ ₹{ltp:.2f} "
+                    f"EXIT {stock.symbol} [{reason}] @ ₹{fill:.2f}{seen} "
                     f"| entry=₹{entry:.2f} | P&L=₹{pnl:+.2f} | R:R={rr:+.2f}R",
                     db)
                 _update_daily_pnl(stock.client_profile_id, pnl, db)
@@ -823,7 +840,8 @@ async def _monitor_tick(db: Session, jwt: str, api_key: str, client_id: str):
                     # Note: trigger orders fill asynchronously — actual fill price
                     # will be fetched via Dhan order status API when needed
 
-        db.commit()
+    # One commit per tick (peak_price ratchet + deferred log lines) instead of one per stock
+    db.commit()
 
 
 # ── EOD force exit ────────────────────────────────────────────────────────────
