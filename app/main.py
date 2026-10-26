@@ -14,6 +14,7 @@ from app.services.algo_engine import (
     run_daily_algo, cleanup_old_snapshots, engine_watchdog, catchup_run_if_needed,
 )
 from app.services.scrip_downloader import download_and_update
+from app.services.token_manager import token_keeper
 
 settings = get_settings()
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -64,7 +65,14 @@ async def morning_scheduler():
         finally:
             db.close()
 
-        # 3. Refresh master data token (market data account) with retry
+        # 3. Refresh Dhan client tokens FIRST (order placement) — a slow/failing master login must not delay them
+        try:
+            await scheduled_morning_refresh(SessionLocal)
+            print("[scheduler] ✓ Dhan client tokens refreshed")
+        except Exception as e:
+            print(f"[scheduler] Dhan client token refresh error: {e}")
+
+        # 4. Refresh master data token (market data account) with retry
         from app.services.master_token import refresh_master_token_now
         master_refreshed = False
         for attempt in range(1, 7):   # retry up to 6 times (every 5 min until 8:30)
@@ -84,13 +92,6 @@ async def morning_scheduler():
 
         if not master_refreshed:
             print("[scheduler] WARNING: Master token refresh failed after 6 attempts")
-
-        # 4. Refresh Dhan client tokens (order placement only)
-        try:
-            await scheduled_morning_refresh(SessionLocal)
-            print("[scheduler] ✓ Dhan client tokens refreshed")
-        except Exception as e:
-            print(f"[scheduler] Dhan client token refresh error: {e}")
 
         # 5. Wait until 8:45 AM then launch algo
         now_ist    = datetime.now(IST)
@@ -124,11 +125,12 @@ async def lifespan(app: FastAPI):
     # run if the server (re)booted after the 8:00 scheduler slot but before the opening scan.
     watchdog_task = asyncio.create_task(engine_watchdog())
     catchup_task  = asyncio.create_task(catchup_run_if_needed())
+    keeper_task   = asyncio.create_task(token_keeper(SessionLocal))
     print("[startup] Morning scheduler started (8AM cleanup+scrip+tokens, 8:45AM algo) + engine watchdog")
 
     yield
 
-    for t in (task, resume_task, watchdog_task, catchup_task):
+    for t in (task, resume_task, watchdog_task, catchup_task, keeper_task):
         t.cancel()
         try:
             await t
