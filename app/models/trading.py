@@ -324,6 +324,11 @@ class AlgoStock(Base):
     status            = Column(String, default="watching")
     buy_order_id      = Column(String, nullable=True)
     sell_order_id     = Column(String, nullable=True)
+    # Live (Dhan) bookkeeping — NULL for paper trades.
+    #   ENTRY_PENDING → ENTRY_OK | ENTRY_FAILED ;  ENTRY_OK → EXIT_OK | EXIT_FAILED
+    live_status       = Column(String, nullable=True)
+    live_entry_price  = Column(Numeric(10, 2), nullable=True)   # actual broker fill
+    live_exit_price   = Column(Numeric(10, 2), nullable=True)   # actual broker fill
     source            = Column(String, default="preopen")
     entry_time        = Column(DateTime(timezone=True), nullable=True)
     exit_time         = Column(DateTime(timezone=True), nullable=True)
