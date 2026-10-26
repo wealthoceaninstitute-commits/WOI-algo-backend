@@ -127,7 +127,7 @@ async def _dhan(fn, profile: ClientProfile, db: Session, *args):
         print(f"[trading] DH-906 mid-session for profile {profile.id} — refreshing")
         new_token = await refresh_token(
             profile, client_id, pin, totp, db,
-            reason="dh906", **proxy_kw
+            reason="dh906", stale_token=token, **proxy_kw
         )
         if new_token:
             result = await fn(new_token, *args, **proxy_kw)
