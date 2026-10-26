@@ -78,7 +78,7 @@ async def _get(path: str, access_token: str, **proxy) -> dict:
             return {"success": True, "data": _parse(r), "token_expired": False}
         if _is_token_expired(r):
             return {"success": False, "token_expired": True,
-                    "message": f"Token expired (DH-906) — auto-refreshing"}
+                    "message": f"Dhan rejected the token (HTTP {r.status_code}): {r.text[:200]}"}
         return {"success": False, "token_expired": False,
                 "message": f"Dhan {r.status_code}: {r.text[:300]}"}
 
