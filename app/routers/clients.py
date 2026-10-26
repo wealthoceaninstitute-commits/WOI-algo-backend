@@ -124,6 +124,12 @@ def update_my_profile(
             val = getattr(payload, field)
             if val is not None:
                 setattr(p, field, val)
+        if payload.paper_trading is not None:
+            # the algo engine reads the strategy flag — keep both in step
+            from app.models.trading import AlgoStrategy
+            strat = db.query(AlgoStrategy).filter(AlgoStrategy.client_profile_id == p.id).first()
+            if strat:
+                strat.paper_trading = payload.paper_trading
 
     db.commit()
     db.refresh(current_user)
