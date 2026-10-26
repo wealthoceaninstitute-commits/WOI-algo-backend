@@ -218,6 +218,11 @@ async def dhan_diagnose(
         "proxy_configured": bool(_proxy(profile)),
         "orders": 0, "trades": 0, "positions": 0, "segments": [],
     }
+    cred = profile.dhan_cred
+    if cred:
+        out["token_expires_at"] = cred.token_expires_at.isoformat() if cred.token_expires_at else None
+        out["last_verified"]    = cred.last_verified.isoformat() if cred.last_verified else None
+        out["last_error"]       = cred.last_error
     if not client_id:
         out["message"] = "Dhan client ID missing / could not be decrypted. Re-save API Credentials."
         return out
