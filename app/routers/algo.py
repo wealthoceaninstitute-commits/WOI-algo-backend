@@ -154,6 +154,9 @@ def _ser_stock(s: AlgoStock) -> dict:
         "status": s.status,
         "buy_order_id": s.buy_order_id,
         "sell_order_id": s.sell_order_id,
+        "live_status": s.live_status,
+        "live_entry_price": float(s.live_entry_price) if s.live_entry_price else None,
+        "live_exit_price": float(s.live_exit_price) if s.live_exit_price else None,
         "source": s.source,
         "entry_time": s.entry_time.isoformat() if s.entry_time else None,
         "exit_time": s.exit_time.isoformat() if s.exit_time else None,
@@ -372,6 +375,7 @@ def update_my_strategy(
     was_active = bool(s.is_active)
     s = _apply_strategy(s, payload)
     _sync_from_master_if_newly_subscribed(s, was_active, db)
+    profile.paper_trading = s.paper_trading      # keep the profile flag in step (engine uses the algo flag)
     db.commit()
     db.refresh(s)
     return AlgoStrategyResponse.from_orm_model(s)
@@ -563,6 +567,7 @@ def update_client_strategy(
     was_active = bool(s.is_active)
     s = _apply_strategy(s, payload)
     _sync_from_master_if_newly_subscribed(s, was_active, db)
+    profile.paper_trading = s.paper_trading      # keep the profile flag in step (engine uses the algo flag)
     db.commit()
     db.refresh(s)
     return AlgoStrategyResponse.from_orm_model(s)
@@ -683,16 +688,25 @@ async def trigger_algo_run(
     _: User = Depends(require_master),
 ):
     """
-    Manually trigger the algo run immediately.
-    Useful for testing or if scheduled run was missed.
+    Manually kick the engine.
+      • before 9:16 AM IST → start today's full run
+      • after  9:16 AM IST → restart MONITORING for today's open positions (a full re-run
+        would overwrite the opening prices); anything that hit SL / target meanwhile is closed.
     Runs in background — returns immediately.
     """
-    from app.services.algo_engine import run_daily_algo
-    background_tasks.add_task(run_daily_algo)
+    from app.services.algo_engine import trigger_or_resume
+    background_tasks.add_task(trigger_or_resume)
     return {
-        "message": "Algo run triggered. Check Railway logs and client WOI Algo page for progress.",
+        "message": "Engine kick requested (full run before 9:16 AM, monitoring restart after). Check the run log on this page.",
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@router.get("/engine/status")
+async def get_engine_status(_: User = Depends(require_master)):
+    """Is the engine alive? seconds since last monitor tick, WebSocket health, live orders in flight."""
+    from app.services.algo_engine import engine_status
+    return engine_status()
 
 
 # ── Debug: price snapshot ─────────────────────────────────────────────────────
