@@ -10,7 +10,9 @@ from app.core.bootstrap import create_master_if_needed
 from app.routers import auth, clients, credentials, trading, algo, market
 from app.routers import master_account, universe, algo_stats
 from app.services.token_manager import scheduled_morning_refresh
-from app.services.algo_engine import run_daily_algo, cleanup_old_snapshots
+from app.services.algo_engine import (
+    run_daily_algo, cleanup_old_snapshots, engine_watchdog, catchup_run_if_needed,
+)
 from app.services.scrip_downloader import download_and_update
 
 settings = get_settings()
@@ -118,11 +120,15 @@ async def lifespan(app: FastAPI):
         from app.services.algo_engine import resume_monitoring_if_needed
         await resume_monitoring_if_needed()
     resume_task = asyncio.create_task(_resume_after_boot())
-    print("[startup] Morning scheduler started (8AM cleanup+scrip+tokens, 8:45AM algo)")
+    # Safety nets: restart monitoring if the engine ever dies mid-session, and start today's
+    # run if the server (re)booted after the 8:00 scheduler slot but before the opening scan.
+    watchdog_task = asyncio.create_task(engine_watchdog())
+    catchup_task  = asyncio.create_task(catchup_run_if_needed())
+    print("[startup] Morning scheduler started (8AM cleanup+scrip+tokens, 8:45AM algo) + engine watchdog")
 
     yield
 
-    for t in (task, resume_task):
+    for t in (task, resume_task, watchdog_task, catchup_task):
         t.cancel()
         try:
             await t
