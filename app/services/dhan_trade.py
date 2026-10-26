@@ -8,6 +8,7 @@ can detect DH-906 and auto-refresh the token without any extra code here.
 
 import httpx
 from typing import Optional
+from urllib.parse import quote
 
 API_BASE = "https://api.dhan.co/v2"
 TIMEOUT  = 15.0
@@ -21,7 +22,7 @@ def _client(
     proxy_port: int = 443,
     proxy_user: Optional[str] = None,
     proxy_pass: Optional[str] = None,
-    proxy_scheme: str = "https",      # ← add this
+    proxy_scheme: str = "https",
 ) -> httpx.AsyncClient:
     headers = {
         "access-token": access_token,
@@ -30,11 +31,13 @@ def _client(
     }
     proxy = None
     if proxy_host:
-        auth = f"{proxy_user}:{proxy_pass}@" if proxy_user and proxy_pass else ""
+        # credentials are URL-quoted so '@', ':' or '/' in a password can't break the URL
+        auth = f"{quote(proxy_user, safe='')}:{quote(proxy_pass, safe='')}@" if proxy_user and proxy_pass else ""
         proxy = f"{proxy_scheme}://{auth}{proxy_host}:{proxy_port}"
+    # `proxy=` works on httpx>=0.26 (incl. 0.28+, where the old `proxies=` was removed)
     return httpx.AsyncClient(
         headers=headers,
-        proxies={"http://": proxy, "https://": proxy} if proxy else None,
+        proxy=proxy,
         timeout=TIMEOUT,
         follow_redirects=True,
     )
@@ -48,13 +51,15 @@ def _parse(resp: httpx.Response):
 
 
 def _is_token_expired(resp: httpx.Response) -> bool:
-    """Detect DH-906 Invalid Token — needs auto-refresh."""
-    if resp.status_code != 400:
+    """Detect an invalid/expired access token (DH-906 as seen in practice, or DH-901) — needs refresh."""
+    if resp.status_code not in (400, 401):
         return False
     try:
-        return resp.json().get("errorCode") == "DH-906"
+        j = resp.json()
+        return (j.get("errorCode") in ("DH-906", "DH-901")
+                or str(j.get("errorType", "")).lower() == "invalid_authentication")
     except Exception:
-        return False
+        return resp.status_code == 401
 
 
 # ── Generic GET wrapper ───────────────────────────────────────────────────────
@@ -216,6 +221,21 @@ async def cancel_order(access_token: str, order_id: str, **proxy) -> dict:
             return {"success": False, "token_expired": True, "message": "Token expired"}
         return {"success": False, "token_expired": False,
                 "message": f"Dhan {r.status_code}: {r.text[:300]}"}
+
+
+async def find_order_by_correlation(access_token: str, correlation_id: str, **proxy) -> Optional[dict]:
+    """
+    Look a just-sent order up by our correlationId. Used after a timeout/network error on
+    POST /orders to find out whether Dhan actually received it — so we never double-place.
+    """
+    res = await get_order_book(access_token, **proxy)
+    if not res.get("success"):
+        return None
+    data = res.get("data")
+    for o in (data if isinstance(data, list) else []):
+        if str(o.get("correlationId") or "") == correlation_id:
+            return o
+    return None
 
 
 # ── Normalizers ───────────────────────────────────────────────────────────────
