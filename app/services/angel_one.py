@@ -21,6 +21,7 @@ Token      : JWT valid 24h + refresh token
 """
 
 import asyncio
+import time
 import httpx
 import pyotp
 from datetime import datetime, date, timezone, timedelta
@@ -274,6 +275,23 @@ async def angel_fetch_full_quote(
 
 # ── Candle data ────────────────────────────────────────────────────────────────
 
+# Angel's historical API allows ~3 requests/second. All candle calls go through one
+# gate so many stocks can be fetched IN PARALLEL without tripping the rate limit.
+CANDLE_MIN_GAP  = 0.36
+CANDLE_TIMEOUT  = 6.0
+_candle_gate    = asyncio.Lock()
+_last_candle_ts = 0.0
+
+
+async def _candle_throttle():
+    global _last_candle_ts
+    async with _candle_gate:
+        wait = CANDLE_MIN_GAP - (time.monotonic() - _last_candle_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_candle_ts = time.monotonic()
+
+
 async def angel_fetch_candle(
     jwt_token: str,
     api_key: str,
@@ -298,9 +316,10 @@ async def angel_fetch_candle(
         "todate":      to_dt,
     }
 
+    await _candle_throttle()
     async with httpx.AsyncClient(
         headers=_headers(jwt_token, api_key, client_id),
-        timeout=TIMEOUT,
+        timeout=CANDLE_TIMEOUT,
     ) as c:
         resp = await c.post(
             f"{API_BASE}/rest/secure/angelbroking/historical/v1/getCandleData",
@@ -331,15 +350,19 @@ async def angel_fetch_first_candle(
     api_key: str,
     client_id: str,
     security_id: str,
-    max_attempts: int = 4,
-    retry_delay: float = 3.0,
+    max_attempts: int = 45,
+    retry_delay: float = 1.0,
 ) -> Optional[dict]:
     """
     First 1-min candle of the day (9:15–9:16 AM IST).
 
-    Angel One often has not published the 9:15 candle at exactly 9:16:00, and
-    the API can also return transient errors/rate limits. So retry (at least 3
-    retries = 4 attempts) with increasing delay before giving up.
+    Angel often has not published the 9:15 candle at exactly 9:16:00, so poll every
+    ~1s (not 3s/6s/9s back-off) until it appears — up to ~45s. Run one of these per
+    stock CONCURRENTLY (see algo_engine._fetch_first_candles); the shared throttle
+    keeps the combined request rate legal.
+
+    Only a candle stamped 09:15 is accepted, so a partial/other-minute bar is never
+    mistaken for the opening candle.
     """
     ist     = timezone(timedelta(hours=5, minutes=30))
     today   = datetime.now(ist).date()
@@ -352,17 +375,16 @@ async def angel_fetch_first_candle(
                 jwt_token, api_key, client_id, security_id,
                 from_dt, to_dt,
             )
-            if candles:
-                if attempt > 1:
-                    print(f"[angel_one] First candle for {security_id} OK on attempt {attempt}/{max_attempts}")
-                return candles[0]
+            for cd in candles:
+                if "09:15" in str(cd.get("timestamp", "")):
+                    if attempt > 1:
+                        print(f"[angel_one] First candle for {security_id} OK on attempt {attempt}/{max_attempts}")
+                    return cd
         except Exception as e:
             print(f"[angel_one] First candle {security_id} attempt {attempt}/{max_attempts} error: {type(e).__name__}: {e}")
 
         if attempt < max_attempts:
-            wait = retry_delay * attempt  # 3s, 6s, 9s
-            print(f"[angel_one] No candle for {security_id} (attempt {attempt}/{max_attempts}) — retrying in {wait:.0f}s")
-            await asyncio.sleep(wait)
+            await asyncio.sleep(retry_delay)
 
     print(f"[angel_one] No first candle for {security_id} after {max_attempts} attempts")
     return None
