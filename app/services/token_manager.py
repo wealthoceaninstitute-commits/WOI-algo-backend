@@ -74,15 +74,18 @@ async def refresh_token(
     totp: str,
     db: Session,
     reason: str = "manual",
+    stale_token: Optional[str] = None,
     **proxy_kw,
 ) -> Optional[str]:
+    """stale_token: a token Dhan just rejected (DH-906). It must never be reused even if the
+    stored expiry time says it is still valid."""
     lock = _get_lock(profile.id)
 
     async with lock:
         db.refresh(profile)
         if token_is_valid(profile) and reason != "forced":
             stored = get_stored_token(profile)
-            if stored:
+            if stored and not (stale_token and stored == stale_token):
                 print("[token_manager] Token already refreshed by parallel request — reusing")
                 return stored
 
@@ -235,3 +238,44 @@ async def scheduled_morning_refresh(db_factory):
         hour=8, minute=0, second=0, microsecond=0
     )
     print(f"[token_manager] Next scheduled refresh at {next_day.strftime('%Y-%m-%d %H:%M IST')}")
+
+
+# ── Keeper: never leave a client with an expired token (restarts, missed 8 AM slot) ──────────
+
+async def refresh_stale_tokens_once(db_factory) -> int:
+    """Refresh every profile whose stored token is missing/expired (per DB expiry). Returns #refreshed."""
+    from app.models.trading import ClientProfile, DhanCredential
+    db: Session = db_factory()
+    done = 0
+    try:
+        profiles = (db.query(ClientProfile)
+                    .join(DhanCredential, DhanCredential.client_profile_id == ClientProfile.id)
+                    .all())
+        for profile in profiles:
+            if token_is_valid(profile):
+                continue
+            if await _refresh_one_profile(profile, db):
+                done += 1
+            await asyncio.sleep(3)
+    except Exception as e:
+        print(f"[token_manager] keeper error: {type(e).__name__}: {e}")
+    finally:
+        db.close()
+    return done
+
+
+async def token_keeper(db_factory):
+    """Runs forever. 20 s after boot, then every 10 min on weekdays 06:00–16:00 IST."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            now = datetime.now(IST)
+            if now.weekday() < 5 and 6 <= now.hour < 16:
+                n = await refresh_stale_tokens_once(db_factory)
+                if n:
+                    print(f"[token_manager] keeper refreshed {n} stale token(s)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[token_manager] keeper loop error: {e}")
+        await asyncio.sleep(600)
