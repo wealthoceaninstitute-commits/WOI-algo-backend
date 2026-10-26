@@ -204,6 +204,54 @@ def _ser_position(p: Position, client_name: str = None) -> dict:
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+@router.get("/dhan/diagnose")
+async def dhan_diagnose(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Tells the client WHY Orders/Trades/Positions are empty (creds, token, proxy, Dhan error, or truly no trades)."""
+    profile = _profile(user, db)
+    client_id, pin, totp = _creds(profile)
+    out = {
+        "ok": False, "stage": "credentials", "message": "",
+        "dhan_client_id_tail": (client_id or "")[-4:] or None,
+        "proxy_configured": bool(_proxy(profile)),
+        "orders": 0, "trades": 0, "positions": 0, "segments": [],
+    }
+    if not client_id:
+        out["message"] = "Dhan client ID missing / could not be decrypted. Re-save API Credentials."
+        return out
+    if not (pin and totp):
+        out["message"] = "Dhan PIN or TOTP secret missing — token cannot be refreshed. Re-save API Credentials."
+        return out
+    out["stage"] = "token"
+    token = await _get_valid_token(profile, db)
+    if not token:
+        out["message"] = "Could not obtain a Dhan access token (check PIN / TOTP secret / proxy)."
+        return out
+    out["stage"] = "dhan"
+    errors = []
+    for key, fn in (("orders", get_order_book), ("trades", get_trade_book), ("positions", get_positions)):
+        r = await _dhan(fn, profile, db)
+        if r.get("success"):
+            rows = _to_list(r.get("data"))
+            out[key] = len(rows)
+            if key == "positions":
+                out["segments"] = sorted({str(x.get("exchangeSegment")) for x in rows})
+        else:
+            errors.append(f"{key}: {r.get('message')}")
+    if errors:
+        out["message"] = " | ".join(errors)
+        return out
+    out["ok"] = True
+    out["stage"] = "done"
+    out["message"] = ("Connected to Dhan account ending " + (client_id[-4:]) +
+                      ("" if (out["orders"] or out["positions"]) else
+                       " — but this Dhan account has no orders/positions today. "
+                       "The manual trades were probably placed in a different Dhan account."))
+    return out
+
+
 @router.get("/orders")
 async def list_orders(
     status: Optional[str] = Query(None),
