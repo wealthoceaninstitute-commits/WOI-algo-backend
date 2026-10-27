@@ -21,6 +21,24 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 _refresh_locks: dict[str, asyncio.Lock] = {}
 
+# Profiles whose login can never succeed without the client fixing their credentials
+# (bad TOTP secret, missing PIN…). Skipped for 6 h so one broken client can't keep the morning job looping.
+_permanent_until: dict[str, float] = {}
+_PERMANENT_MARKERS = ("non-base32", "incorrect padding", "missing credentials", "invalid client id", "invalid pin")
+
+
+def _mark_permanent_if_needed(profile_id: str, msg: str) -> bool:
+    import time as _t
+    if any(m in (msg or "").lower() for m in _PERMANENT_MARKERS):
+        _permanent_until[profile_id] = _t.time() + 6 * 3600
+        return True
+    return False
+
+
+def _is_skipped(profile_id: str) -> bool:
+    import time as _t
+    return _permanent_until.get(profile_id, 0) > _t.time()
+
 def _get_lock(profile_id: str) -> asyncio.Lock:
     if profile_id not in _refresh_locks:
         _refresh_locks[profile_id] = asyncio.Lock()
@@ -125,6 +143,9 @@ async def _refresh_one_profile(profile, db: Session) -> bool:
         totp      = decrypt(cred.totp_secret)
         if not client_id or not pin or not totp:
             print(f"[token_manager] Profile {profile.id}: missing credentials")
+            cred.last_error = "Dhan credentials incomplete (client id / PIN / TOTP secret)"
+            db.commit()
+            _mark_permanent_if_needed(profile.id, "missing credentials")
             return False
 
         proxy_kw = _get_proxy_kwargs(profile)
@@ -138,6 +159,7 @@ async def _refresh_one_profile(profile, db: Session) -> bool:
             cred.last_verified    = datetime.now(timezone.utc)
             cred.token_expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
             db.commit()
+            _permanent_until.pop(profile.id, None)
             t_fp = f"{new_token[:12]}...{new_token[-6:]}" if len(new_token) > 18 else "SHORT"
             print(f"[token_manager] ✓ Client token refreshed: profile {profile.id} "
                   f"| fp={t_fp} "
@@ -148,10 +170,19 @@ async def _refresh_one_profile(profile, db: Session) -> bool:
             print(f"[token_manager] ✗ Failed: profile {profile.id}: {msg}")
             cred.last_error = msg
             db.commit()
+            _mark_permanent_if_needed(profile.id, msg)
             return False
 
     except Exception as e:
         print(f"[token_manager] Error: profile {profile.id}: {e}")
+        try:
+            cred.last_error = f"{type(e).__name__}: {e}"[:300]
+            db.commit()
+        except Exception:
+            db.rollback()
+        if _mark_permanent_if_needed(profile.id, str(e)):
+            print(f"[token_manager] → profile {profile.id}: credentials are invalid, skipping retries for 6 h "
+                  f"(client must fix their TOTP secret / PIN)")
         return False
 
 
@@ -162,8 +193,9 @@ async def _refresh_all_with_retry(db_factory, deadline_ist: datetime):
     """
     from app.models.trading import ClientProfile, DhanCredential
 
-    RETRY_INTERVAL = 5 * 60   # 5 minutes between retries
+    RETRY_INTERVAL = 2 * 60   # retry only the profiles that failed, every 2 minutes
     attempt        = 0
+    pending: Optional[set[str]] = None   # None = first pass (everyone)
 
     while datetime.now(IST) < deadline_ist:
         attempt += 1
@@ -174,44 +206,42 @@ async def _refresh_all_with_retry(db_factory, deadline_ist: datetime):
                 .join(DhanCredential, DhanCredential.client_profile_id == ClientProfile.id)
                 .all()
             )
+            if pending is not None:
+                profiles = [p for p in profiles if p.id in pending]
+            profiles = [p for p in profiles if not _is_skipped(p.id)]
 
             if not profiles:
-                print("[token_manager] No client profiles found")
+                print("[token_manager] Nothing (left) to refresh")
                 return
 
             print(f"\n[token_manager] === Token refresh attempt {attempt} "
-                  f"({datetime.now(IST).strftime('%H:%M:%S IST')}) — "
-                  f"{len(profiles)} client(s) ===")
+                  f"({datetime.now(IST).strftime('%H:%M:%S IST')}) — {len(profiles)} client(s) ===")
 
-            failed = []
+            failed = set()
             for i, profile in enumerate(profiles):
                 if i > 0:
-                    await asyncio.sleep(5)   # stagger between clients
-
-                success = await _refresh_one_profile(profile, db)
-                if not success:
-                    failed.append(profile.id)
+                    await asyncio.sleep(2)   # stagger between clients
+                if not await _refresh_one_profile(profile, db):
+                    if not _is_skipped(profile.id):
+                        failed.add(profile.id)
 
             if not failed:
-                print(f"[token_manager] ✓ All {len(profiles)} token(s) refreshed successfully")
+                print("[token_manager] ✓ All refreshable tokens refreshed")
                 return
 
-            # Some failed — decide whether to retry
+            pending = failed
             remaining = (deadline_ist - datetime.now(IST)).total_seconds()
-            if remaining > RETRY_INTERVAL:
-                print(f"[token_manager] {len(failed)} token(s) failed. "
-                      f"Retrying in 5 min "
-                      f"(deadline: {deadline_ist.strftime('%H:%M IST')} — "
-                      f"{int(remaining/60)}min remaining)")
+            if remaining > RETRY_INTERVAL and attempt < 6:
+                print(f"[token_manager] {len(failed)} token(s) failed — retrying only those in 2 min")
                 await asyncio.sleep(RETRY_INTERVAL)
             else:
-                print(f"[token_manager] {len(failed)} token(s) still failing. "
-                      f"Deadline reached — giving up. "
-                      f"Market Watch will show 401 until manual refresh.")
+                print(f"[token_manager] {len(failed)} token(s) still failing — giving up for now "
+                      f"(the keeper keeps trying every 10 min)")
                 return
 
         except Exception as e:
             print(f"[token_manager] Refresh loop error: {e}")
+            await asyncio.sleep(30)
         finally:
             db.close()
 
@@ -252,7 +282,7 @@ async def refresh_stale_tokens_once(db_factory) -> int:
                     .join(DhanCredential, DhanCredential.client_profile_id == ClientProfile.id)
                     .all())
         for profile in profiles:
-            if token_is_valid(profile):
+            if token_is_valid(profile) or _is_skipped(profile.id):
                 continue
             if await _refresh_one_profile(profile, db):
                 done += 1
