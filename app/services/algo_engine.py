@@ -2085,6 +2085,39 @@ async def catchup_run_if_needed():
     await run_daily_algo()
 
 
+def todays_run_exists() -> bool:
+    db = SessionLocal()
+    try:
+        return db.query(AlgoRun).filter(AlgoRun.run_date == date.today()).count() > 0
+    finally:
+        db.close()
+
+
+async def algo_start_guard():
+    """
+    Independent of the 8:00 scheduler: if nothing has started today's run by 8:46 (scheduler stuck
+    on a slow scrip download / token retry, crashed, or the server restarted), start it — but only
+    while the 9:12:30 opening scan can still happen on time.
+    """
+    while True:
+        try:
+            await asyncio.sleep(20)
+            now = datetime.now(IST)
+            if now.weekday() >= 5 or _algo_running:
+                continue
+            if not (now.replace(hour=8, minute=46, second=0, microsecond=0) <= now
+                    < now.replace(hour=9, minute=12, second=0, microsecond=0)):
+                continue
+            if await asyncio.to_thread(todays_run_exists):
+                continue
+            print("[algo] START GUARD: no run started by 8:46 — starting today's run now")
+            await run_daily_algo()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[algo] start guard error: {type(e).__name__}: {e}")
+
+
 async def trigger_or_resume() -> str:
     """Manual 'Trigger Run Now': before 9:16 start the normal run; after 9:16 restart monitoring."""
     now = datetime.now(IST)
