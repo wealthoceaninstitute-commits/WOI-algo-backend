@@ -17,6 +17,7 @@ from app.services.scrip_downloader import download_and_update
 from app.services.token_manager import token_keeper
 
 settings = get_settings()
+_client_token_task = None
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -58,40 +59,45 @@ async def morning_scheduler():
         # 2. Update scrip master
         db = SessionLocal()
         try:
-            result = await download_and_update(db)
+            result = await asyncio.wait_for(download_and_update(db), timeout=600)
             print(f"[scheduler] Scrip master: {result.get('total_downloaded',0)} stocks updated")
         except Exception as e:
             print(f"[scheduler] Scrip master error: {e}")
         finally:
             db.close()
 
-        # 3. Refresh Dhan client tokens FIRST (order placement) — a slow/failing master login must not delay them
-        try:
-            await scheduled_morning_refresh(SessionLocal)
-            print("[scheduler] ✓ Dhan client tokens refreshed")
-        except Exception as e:
-            print(f"[scheduler] Dhan client token refresh error: {e}")
-
-        # 4. Refresh master data token (market data account) with retry
+        # 3. Refresh master data token (market data account) with retry
         from app.services.master_token import refresh_master_token_now
         master_refreshed = False
-        for attempt in range(1, 7):   # retry up to 6 times (every 5 min until 8:30)
+        for attempt in range(1, 7):   # retry up to 6 times, 1 min apart
             db = SessionLocal()
             try:
-                token, cid = await refresh_master_token_now(db)
+                _res = await refresh_master_token_now(db)   # returns (jwt, api_key, client_id)
+                cid  = _res[-1]
                 print(f"[scheduler] ✓ Master data token refreshed (client_id: {cid})")
                 master_refreshed = True
                 break
             except Exception as e:
                 print(f"[scheduler] Master token attempt {attempt} failed: {e}")
                 if attempt < 6:
-                    print(f"[scheduler] Retrying master token in 5 min...")
-                    await asyncio.sleep(300)
+                    print(f"[scheduler] Retrying master token in 1 min...")
+                    await asyncio.sleep(60)
             finally:
                 db.close()
 
         if not master_refreshed:
             print("[scheduler] WARNING: Master token refresh failed after 6 attempts")
+
+        # 4. Dhan client tokens (order placement) run in the BACKGROUND — they retry for up to an hour
+        #    when a client's login fails and must never hold up the 8:45 algo start.
+        async def _client_tokens_bg():
+            try:
+                await scheduled_morning_refresh(SessionLocal)
+                print("[scheduler] ✓ Dhan client tokens refreshed")
+            except Exception as e:
+                print(f"[scheduler] Dhan client token refresh error: {e}")
+        global _client_token_task
+        _client_token_task = asyncio.create_task(_client_tokens_bg())
 
         # 5. Wait until 8:45 AM then launch algo
         now_ist    = datetime.now(IST)
@@ -103,7 +109,11 @@ async def morning_scheduler():
 
         print(f"[scheduler] === 8:45 AM algo run starting ===")
         try:
-            await run_daily_algo()
+            from app.services.algo_engine import todays_run_exists
+            if await asyncio.to_thread(todays_run_exists):
+                print("[scheduler] Today's run already exists (started by guard/catch-up) — not starting another")
+            else:
+                await run_daily_algo()
         except Exception as e:
             print(f"[scheduler] Algo run error: {e}")
 
@@ -126,11 +136,13 @@ async def lifespan(app: FastAPI):
     watchdog_task = asyncio.create_task(engine_watchdog())
     catchup_task  = asyncio.create_task(catchup_run_if_needed())
     keeper_task   = asyncio.create_task(token_keeper(SessionLocal))
+    from app.services.algo_engine import algo_start_guard
+    guard_task    = asyncio.create_task(algo_start_guard())
     print("[startup] Morning scheduler started (8AM cleanup+scrip+tokens, 8:45AM algo) + engine watchdog")
 
     yield
 
-    for t in (task, resume_task, watchdog_task, catchup_task, keeper_task):
+    for t in (task, resume_task, watchdog_task, catchup_task, keeper_task, guard_task):
         t.cancel()
         try:
             await t
