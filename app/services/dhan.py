@@ -2,6 +2,7 @@
 Dhan API service — auto-generates access token using Client ID + PIN + TOTP.
 Supports scheme (http/https) in proxy URL — matches DHAN_PROXY_SCHEME env var.
 """
+import asyncio
 import time
 import pyotp
 import httpx
@@ -80,12 +81,12 @@ async def generate_access_token(
         if proxy_host else None
     )
 
-    for attempt in range(2):
+    for attempt in range(3):
         totp_code = _generate_totp(totp_secret)
         secs_left = _seconds_until_next_window()
 
-        if secs_left <= 2 and attempt == 0:
-            time.sleep(secs_left + 1)
+        if secs_left <= 3:
+            await asyncio.sleep(secs_left + 1)      # never send a code about to expire (async: don't block the loop)
             totp_code = _generate_totp(totp_secret)
 
         url = (
@@ -111,6 +112,11 @@ async def generate_access_token(
                             "message": "Token generated successfully",
                             "checked_at": checked_at,
                         }
+                    # Dhan answers HTTP 200 {"message":"Invalid TOTP"} when the code was just rotated or the
+                    # same code was already used. A code can't be reused → wait for the NEXT 30 s window.
+                    if "totp" in str(data).lower() and attempt < 2:
+                        await asyncio.sleep(_seconds_until_next_window() + 1)
+                        continue
                     return {
                         "success": False,
                         "message": f"Token not in response: {data}",
@@ -118,8 +124,8 @@ async def generate_access_token(
                     }
 
                 elif resp.status_code == 401:
-                    if attempt == 0:
-                        time.sleep(2)
+                    if attempt < 2:
+                        await asyncio.sleep(_seconds_until_next_window() + 1)
                         continue
                     return {
                         "success": False,
