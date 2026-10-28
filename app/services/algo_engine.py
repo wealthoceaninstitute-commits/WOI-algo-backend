@@ -108,7 +108,7 @@ def _log_runs_sync(run_ids: list[str], msg: str):
     db = SessionLocal()
     try:
         line = f"[{_stamp()}] {msg}"
-        for rid in run_ids:
+        for rid in sorted(set(run_ids)):
             _append_run_log(db, rid, [line])
         db.commit()
     except Exception as e:
@@ -889,11 +889,22 @@ def _entry_levels(candle: dict, strategy, security_id: str) -> dict:
     }
 
 
-def _apply_candle_sync(sid: str, candle: Optional[dict], stock_ids: list[str]):
-    """Write the candle-derived levels to every client's row for this security (worker thread)."""
+def _apply_candle_sync(sid: str, candle: Optional[dict], stock_ids: list[str]) -> int:
+    """
+    Write the candle-derived levels to every client's row for this security (worker thread).
+    Returns how many of the stocks could NOT be saved (0 = all good) so the caller can retry.
+
+    Phase 1 only touches AlgoStock rows (each security's rows are its own) and commits at once.
+    Phase 2 appends the log lines to the run rows — sorted by run id, one short commit per run — so
+    several securities finishing at the same moment can never deadlock on the shared run rows
+    (that deadlock silently dropped one stock's levels, leaving it stuck on "waiting").
+    """
     db = SessionLocal()
+    logs: dict[str, list[str]] = {}
+    failed = 0
     try:
-        stocks = db.query(AlgoStock).filter(AlgoStock.id.in_(stock_ids)).all()
+        stocks = (db.query(AlgoStock).filter(AlgoStock.id.in_(stock_ids))
+                  .order_by(AlgoStock.run_id, AlgoStock.id).all())
         pids   = {s.client_profile_id for s in stocks}
         strat_by_pf = {x.client_profile_id: x for x in
                        db.query(AlgoStrategy).filter(AlgoStrategy.client_profile_id.in_(pids)).all()} if pids else {}
@@ -909,21 +920,51 @@ def _apply_candle_sync(sid: str, candle: Optional[dict], stock_ids: list[str]):
                 stock.buy_trigger  = e["buy_trigger"]
                 stock.sell_trigger = e["sell_trigger"]
                 stock.quantity     = e["quantity"]
-                _append_run_log(db, stock.run_id, [
+                logs.setdefault(stock.run_id, []).append(
                     f"[{_stamp()}] {stock.symbol}: O=₹{e['candle_open']:.2f} "
                     f"H=₹{e['candle_high']:.2f} L=₹{e['candle_low']:.2f} C=₹{e['candle_close']:.2f} | "
-                    f"BUY=₹{e['buy_trigger']:.2f} | SELL=₹{e['sell_trigger']:.2f} | Qty={e['quantity']}"
-                ])
-            else:
+                    f"BUY=₹{e['buy_trigger']:.2f} | SELL=₹{e['sell_trigger']:.2f} | Qty={e['quantity']}")
+            elif not candle:
                 stock.status = "cancelled"
                 stock.exit_reason = "NO_CANDLE"
-                _append_run_log(db, stock.run_id, [
-                    f"[{_stamp()}] {stock.symbol}: No first-candle data after 45s — skipped"
-                ])
+                logs.setdefault(stock.run_id, []).append(
+                    f"[{_stamp()}] {stock.symbol}: No first-candle data after 45s — skipped")
+            else:
+                failed += 1       # no strategy row for this client — nothing to apply
         db.commit()
     except Exception as e:
         print(f"[algo] apply_candle {sid} failed: {type(e).__name__}: {e}")
-        db.rollback()
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        db.close()
+        return max(1, len(stock_ids))
+    # Phase 2 — logs (best effort; never blocks or undoes the levels above)
+    try:
+        for rid in sorted(logs):
+            for attempt in range(3):
+                try:
+                    _append_run_log(db, rid, logs[rid])
+                    db.commit()
+                    break
+                except Exception as e:
+                    db.rollback()
+                    if attempt == 2:
+                        print(f"[algo] candle log write failed for run {rid}: {type(e).__name__}: {e}")
+    finally:
+        db.close()
+    return failed
+
+
+def _levels_missing_sync(stock_ids: list[str]) -> int:
+    db = SessionLocal()
+    try:
+        return db.query(AlgoStock).filter(
+            AlgoStock.id.in_(stock_ids), AlgoStock.status == "watching",
+            AlgoStock.buy_trigger.is_(None)).count()
+    except Exception:
+        return 0
     finally:
         db.close()
 
@@ -934,10 +975,45 @@ async def _candle_worker(sid: str, stock_ids: list[str], jwt: str, api_key: str,
         candle = await angel_fetch_first_candle(jwt, api_key, client_id, sid)
     except Exception as e:
         print(f"[algo] first candle {sid} failed: {type(e).__name__}: {e}")
+
+    # Apply, verify, retry — a stock must never be left silently "waiting" without trigger levels.
+    for attempt in range(1, 5):
+        try:
+            await asyncio.to_thread(_apply_candle_sync, sid, candle, stock_ids)
+            if await asyncio.to_thread(_levels_missing_sync, stock_ids) == 0:
+                return
+        except Exception as e:
+            print(f"[algo] apply candle {sid} attempt {attempt} failed: {type(e).__name__}: {e}")
+        await asyncio.sleep(0.4 * attempt)
+
     try:
-        await asyncio.to_thread(_apply_candle_sync, sid, candle, stock_ids)
+        runs = await asyncio.to_thread(_runs_of_stocks_sync, stock_ids)
+        await asyncio.to_thread(_log_runs_sync, runs,
+                                f"WARNING: could not save first-candle levels for security {sid} — stock will be skipped")
+        await asyncio.to_thread(_cancel_unlevelled_sync, stock_ids)
     except Exception as e:
-        print(f"[algo] apply candle {sid} failed: {type(e).__name__}: {e}")
+        print(f"[algo] candle give-up bookkeeping failed for {sid}: {type(e).__name__}: {e}")
+
+
+def _runs_of_stocks_sync(stock_ids: list[str]) -> list[str]:
+    db = SessionLocal()
+    try:
+        return sorted({r for (r,) in db.query(AlgoStock.run_id).filter(AlgoStock.id.in_(stock_ids)).all()})
+    finally:
+        db.close()
+
+
+def _cancel_unlevelled_sync(stock_ids: list[str]):
+    db = SessionLocal()
+    try:
+        db.execute(update(AlgoStock).where(
+            AlgoStock.id.in_(stock_ids), AlgoStock.status == "watching",
+            AlgoStock.buy_trigger.is_(None)).values(status="cancelled", exit_reason="NO_CANDLE"))
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 # ── NSE tick size ─────────────────────────────────────────────────────────────
@@ -1281,14 +1357,18 @@ class _Book:
                      f"LIVE client: {stock.symbol} has no broker position for this trade — exit recorded in the algo only, no order sent")
 
     def flush(self):
-        for rid, n in self.traded.items():
-            self.db.execute(update(AlgoRun).where(AlgoRun.id == rid).values(
-                stocks_traded=func.coalesce(AlgoRun.stocks_traded, 0) + n))
-        for rid, p in self.pnl.items():
-            self.db.execute(update(AlgoRun).where(AlgoRun.id == rid).values(
-                total_pnl=func.coalesce(AlgoRun.total_pnl, 0) + p))
-        for rid, lines in self.logs.items():
-            _append_run_log(self.db, rid, lines)
+        # ONE pass over run rows in a fixed (sorted) order: concurrent writers (candle workers, live-order
+        # tasks, the log helper) all lock run rows in the same order, so Postgres can never deadlock them.
+        for rid in sorted(set(self.traded) | set(self.pnl) | set(self.logs)):
+            vals = {}
+            if rid in self.traded:
+                vals["stocks_traded"] = func.coalesce(AlgoRun.stocks_traded, 0) + self.traded[rid]
+            if rid in self.pnl:
+                vals["total_pnl"] = func.coalesce(AlgoRun.total_pnl, 0) + self.pnl[rid]
+            if rid in self.logs and self.logs[rid]:
+                vals["log"] = func.coalesce(AlgoRun.log, "") + "".join(l + "\n" for l in self.logs[rid])
+            if vals:
+                self.db.execute(update(AlgoRun).where(AlgoRun.id == rid).values(**vals))
         self.db.commit()
 
 
