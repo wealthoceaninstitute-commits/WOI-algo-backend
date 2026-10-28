@@ -82,38 +82,24 @@ def _sync_from_master_if_newly_subscribed(s: AlgoStrategy, was_active: bool, db:
 
 
 def _apply_strategy(s: AlgoStrategy, payload: AlgoStrategyRequest) -> AlgoStrategy:
-    s.name                  = payload.name
-    s.is_active             = payload.is_active
-    s.paper_trading         = payload.paper_trading
-    s.gap_min               = payload.gap_min
-    s.gap_max               = payload.gap_max
-    s.max_stocks_per_day    = payload.max_stocks_per_day
-    s.live_scan_seconds     = payload.live_scan_seconds
-    s.risk_per_trade        = payload.risk_per_trade
-    s.entry_buffer_pct      = payload.entry_buffer_pct
-    s.sl_pct                = payload.sl_pct
-    s.entry_reference       = payload.entry_reference
-    s.use_first_candle      = payload.use_first_candle
-    s.disable_shift         = payload.disable_shift
-    s.boring_ratio          = payload.boring_ratio
-    s.entry_missed_cancel   = payload.entry_missed_cancel
-    s.entry_missed_cancel_r = payload.entry_missed_cancel_r
-    s.target_r              = payload.target_r
-    s.trail_sl_steps        = json.dumps([[t.r_trigger, t.lock_r] for t in payload.trail_sl_steps])
-    s.tp_on_exchange        = payload.tp_on_exchange
-    s.tp_exchange_place_r   = payload.tp_exchange_place_r
-    s.tp_exchange_cancel_r  = payload.tp_exchange_cancel_r
-    s.reentry_mode          = payload.reentry_mode
-    s.max_reentry_attempts  = payload.max_reentry_attempts
-    s.gap_direction_bias    = payload.gap_direction_bias
-    s.sl_basis              = payload.sl_basis
-    # Stock universe & filters
-    s.universe_id           = payload.universe_id
-    s.min_price             = payload.min_price
-    s.max_price             = payload.max_price
-    s.min_volume            = payload.min_volume
-    s.min_turnover_cr       = payload.min_turnover_cr
-    s.exclude_be_series     = payload.exclude_be_series
+    """
+    Apply ONLY the fields present in the request body. A subscribe / unsubscribe toggle that sends
+    just {"is_active": true} therefore changes nothing else (mode, universe, filters stay as stored);
+    a full-form save from the master still updates every field it sends.
+    """
+    sent = payload.model_fields_set
+    for f in (
+        "name", "is_active", "paper_trading", "gap_min", "gap_max", "max_stocks_per_day", "live_scan_seconds",
+        "risk_per_trade", "entry_buffer_pct", "sl_pct", "entry_reference", "use_first_candle", "disable_shift",
+        "boring_ratio", "entry_missed_cancel", "entry_missed_cancel_r", "target_r", "tp_on_exchange",
+        "tp_exchange_place_r", "tp_exchange_cancel_r", "reentry_mode", "max_reentry_attempts",
+        "gap_direction_bias", "sl_basis", "universe_id", "min_price", "max_price", "min_volume",
+        "min_turnover_cr", "exclude_be_series",
+    ):
+        if f in sent:
+            setattr(s, f, getattr(payload, f))
+    if "trail_sl_steps" in sent:
+        s.trail_sl_steps = json.dumps([[t.r_trigger, t.lock_r] for t in payload.trail_sl_steps])
     return s
 
 
