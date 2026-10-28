@@ -83,34 +83,54 @@ class AlgoStrategyResponse(AlgoStrategyRequest):
         except Exception:
             steps = []
 
-        return cls(
+        # NULL / bad values in an old row must never take the page down — fall back to the defaults.
+        def F(v, d):
+            try:
+                return float(v) if v is not None else d
+            except Exception:
+                return d
+
+        def I(v, d):
+            try:
+                return int(v) if v is not None else d
+            except Exception:
+                return d
+
+        def B(v, d):
+            return bool(v) if v is not None else d
+
+        def S(v, d):
+            return v if v else d
+
+        # model_construct: values are returned as stored (no range re-validation on the way OUT)
+        return cls.model_construct(
             id=m.id,
             client_profile_id=m.client_profile_id,
-            name=m.name,
-            is_active=m.is_active,
-            paper_trading=m.paper_trading,
-            gap_min=float(m.gap_min),
-            gap_max=float(m.gap_max),
-            max_stocks_per_day=m.max_stocks_per_day,
-            live_scan_seconds=m.live_scan_seconds,
-            risk_per_trade=float(m.risk_per_trade),
-            entry_buffer_pct=float(m.entry_buffer_pct),
-            sl_pct=float(m.sl_pct),
-            entry_reference=m.entry_reference,
-            use_first_candle=m.use_first_candle,
-            disable_shift=m.disable_shift,
-            boring_ratio=float(m.boring_ratio),
-            entry_missed_cancel=m.entry_missed_cancel,
-            entry_missed_cancel_r=float(m.entry_missed_cancel_r),
-            target_r=float(m.target_r),
+            name=S(m.name, "WOI"),
+            is_active=B(m.is_active, False),
+            paper_trading=B(m.paper_trading, True),
+            gap_min=F(m.gap_min, 3.0),
+            gap_max=F(m.gap_max, 8.0),
+            max_stocks_per_day=I(m.max_stocks_per_day, 5),
+            live_scan_seconds=I(m.live_scan_seconds, 60),
+            risk_per_trade=F(m.risk_per_trade, 400.0),
+            entry_buffer_pct=F(m.entry_buffer_pct, 0.004),
+            sl_pct=F(m.sl_pct, 0.004),
+            entry_reference=S(m.entry_reference, "close"),
+            use_first_candle=B(m.use_first_candle, True),
+            disable_shift=B(m.disable_shift, True),
+            boring_ratio=F(m.boring_ratio, 0.35),
+            entry_missed_cancel=B(m.entry_missed_cancel, True),
+            entry_missed_cancel_r=F(m.entry_missed_cancel_r, 1.5),
+            target_r=F(m.target_r, 4.0),
             trail_sl_steps=steps,
-            tp_on_exchange=m.tp_on_exchange,
-            tp_exchange_place_r=float(m.tp_exchange_place_r),
-            tp_exchange_cancel_r=float(m.tp_exchange_cancel_r),
-            reentry_mode=m.reentry_mode,
-            max_reentry_attempts=m.max_reentry_attempts,
-            gap_direction_bias=m.gap_direction_bias,
-            sl_basis=m.sl_basis,
+            tp_on_exchange=B(m.tp_on_exchange, True),
+            tp_exchange_place_r=F(m.tp_exchange_place_r, 2.0),
+            tp_exchange_cancel_r=F(m.tp_exchange_cancel_r, 1.0),
+            reentry_mode=S(m.reentry_mode, "both_sides"),
+            max_reentry_attempts=I(m.max_reentry_attempts, 0),
+            gap_direction_bias=B(m.gap_direction_bias, False),
+            sl_basis=S(m.sl_basis, "trigger"),
             universe_id=m.universe_id,
             min_price=float(m.min_price) if m.min_price else 50.0,
             max_price=float(m.max_price) if m.max_price else 10000.0,
