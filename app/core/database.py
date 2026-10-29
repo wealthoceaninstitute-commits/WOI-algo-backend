@@ -5,8 +5,15 @@ from app.core.config import get_settings
 settings = get_settings()
 db_url = settings.DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(db_url, pool_pre_ping=True, pool_size=5, max_overflow=10)
+# API pool: dashboards / login / routers (get_db). Bursty — 28 clients polling can fill it.
+engine = create_engine(db_url, pool_pre_ping=True, pool_size=10, max_overflow=10, pool_timeout=20)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# ENGINE pool: the algo engine (scan, monitor loop, live-order tasks, token jobs) only.
+# Separate from the API pool so dashboard traffic can never starve trading (and vice-versa).
+# Total = 20 (API) + 20 (engine) max connections; check Postgres max_connections (Railway default is ~100).
+engine_engine = create_engine(db_url, pool_pre_ping=True, pool_size=8, max_overflow=12, pool_timeout=30)
+EngineSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine_engine)
 Base = declarative_base()
 
 
