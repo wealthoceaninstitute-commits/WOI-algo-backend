@@ -562,6 +562,7 @@ def update_client_strategy(
 @router.get("/{client_profile_id}/runs")
 def get_client_runs(
     client_profile_id: str,
+    limit: int = 30,
     db: Session = Depends(get_db),
     _: User = Depends(require_master),
 ):
@@ -569,7 +570,7 @@ def get_client_runs(
         db.query(AlgoRun)
         .filter(AlgoRun.client_profile_id == client_profile_id)
         .order_by(AlgoRun.run_date.desc())
-        .limit(30)
+        .limit(max(1, min(limit, 60)))
         .all()
     )
     return [_ser_run(r) for r in runs]
