@@ -36,7 +36,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy import text, update, func, case
 
-from app.core.database import SessionLocal
+from app.core.database import EngineSessionLocal as SessionLocal   # engine has its OWN pool (API traffic can't starve it)
 from app.core.encryption import decrypt
 from app.models.trading import (
     ClientProfile, AlgoStrategy, AlgoRun, AlgoStock,
@@ -2380,7 +2380,9 @@ async def run_daily_algo():
             _log(run, f"Gap distribution: {bands}", db)
 
         # ── STEP 3: Filter & select ─────────────────────────────────────
-        for profile, strategy in clients:
+        # One client's failure (DB hiccup, bad config) must never stop the other clients.
+        # Failed clients are retried once; anything still failing is noted in that client's log only.
+        async def _select_for_client(profile, strategy):
             run, strat = runs[profile.id]
             client_sids = {u["security_id"] for u in client_universes[profile.id]}
             client_gaps = {sid: d for sid, d in all_gaps.items() if sid in client_sids}
@@ -2443,6 +2445,32 @@ async def run_daily_algo():
                             source="preopen",
                         ))
                 db.commit()
+
+        pending = list(clients)
+        for _attempt in (1, 2):
+            failed = []
+            for profile, strategy in pending:
+                try:
+                    await _select_for_client(profile, strategy)
+                except Exception as e:
+                    print(f"[algo] Stock selection failed for client {profile.id} (attempt {_attempt}): {type(e).__name__}: {e}")
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    failed.append((profile, strategy))
+            pending = failed
+            if not pending:
+                break
+            await asyncio.sleep(2)
+        for profile, strategy in pending:
+            try:
+                _log(runs[profile.id][0], "Stock selection failed twice — no stocks for this client today (other clients unaffected)", db)
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
 
         # ── STEP 4: 9:16:00 first candle ───────────────────────────────
         # ONE candle fetch per unique security_id, ALL in parallel; the monitor loop starts
