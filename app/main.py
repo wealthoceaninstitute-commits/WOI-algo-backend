@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from app.core.config import get_settings
-from app.core.database import create_tables, SessionLocal
+from app.core.database import create_tables, EngineSessionLocal
+from app.core.engine_lock import acquire_engine_lock, run_engine_requested
 from app.core.bootstrap import create_master_if_needed
 from app.routers import auth, clients, credentials, trading, algo, market
 from app.routers import master_account, universe, algo_stats
@@ -48,7 +49,7 @@ async def morning_scheduler():
         print(f"[scheduler] === 8:00 AM tasks starting {target_8.strftime('%Y-%m-%d')} ===")
 
         # 1. Clean up old price snapshots BEFORE new fetch
-        db = SessionLocal()
+        db = EngineSessionLocal()
         try:
             cleanup_old_snapshots(db)
         except Exception as e:
@@ -57,7 +58,7 @@ async def morning_scheduler():
             db.close()
 
         # 2. Update scrip master
-        db = SessionLocal()
+        db = EngineSessionLocal()
         try:
             result = await asyncio.wait_for(download_and_update(db), timeout=600)
             print(f"[scheduler] Scrip master: {result.get('total_downloaded',0)} stocks updated")
@@ -70,7 +71,7 @@ async def morning_scheduler():
         from app.services.master_token import refresh_master_token_now
         master_refreshed = False
         for attempt in range(1, 7):   # retry up to 6 times, 1 min apart
-            db = SessionLocal()
+            db = EngineSessionLocal()
             try:
                 _res = await refresh_master_token_now(db)   # returns (jwt, api_key, client_id)
                 cid  = _res[-1]
@@ -92,7 +93,7 @@ async def morning_scheduler():
         #    when a client's login fails and must never hold up the 8:45 algo start.
         async def _client_tokens_bg():
             try:
-                await scheduled_morning_refresh(SessionLocal)
+                await scheduled_morning_refresh(EngineSessionLocal)
                 print("[scheduler] ✓ Dhan client tokens refreshed")
             except Exception as e:
                 print(f"[scheduler] Dhan client token refresh error: {e}")
@@ -118,36 +119,66 @@ async def morning_scheduler():
             print(f"[scheduler] Algo run error: {e}")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    create_tables()
-    create_master_if_needed()
+def start_engine_tasks() -> list:
+    """
+    Start every background task that makes up the trading engine.
 
-    task = asyncio.create_task(morning_scheduler())
-
+    Called by app.worker (always) and by app.main (only when RUN_ENGINE=1).
+    The caller must already hold the engine lock.
+    """
     # If we restarted mid-session, resume watching open positions (SL / target / trail)
     async def _resume_after_boot():
         await asyncio.sleep(5)
         from app.services.algo_engine import resume_monitoring_if_needed
         await resume_monitoring_if_needed()
-    resume_task = asyncio.create_task(_resume_after_boot())
+
     # Safety nets: restart monitoring if the engine ever dies mid-session, and start today's
     # run if the server (re)booted after the 8:00 scheduler slot but before the opening scan.
-    watchdog_task = asyncio.create_task(engine_watchdog())
-    catchup_task  = asyncio.create_task(catchup_run_if_needed())
-    keeper_task   = asyncio.create_task(token_keeper(SessionLocal))
     from app.services.algo_engine import algo_start_guard
-    guard_task    = asyncio.create_task(algo_start_guard())
-    print("[startup] Morning scheduler started (8AM cleanup+scrip+tokens, 8:45AM algo) + engine watchdog")
 
-    yield
+    tasks = [
+        asyncio.create_task(morning_scheduler()),
+        asyncio.create_task(_resume_after_boot()),
+        asyncio.create_task(engine_watchdog()),
+        asyncio.create_task(catchup_run_if_needed()),
+        asyncio.create_task(token_keeper(EngineSessionLocal)),
+        asyncio.create_task(algo_start_guard()),
+    ]
+    print("[engine] Tasks started — morning scheduler (8:00 cleanup+scrip+tokens, 8:45 algo), "
+          "resume, watchdog, catch-up, token keeper, start guard")
+    return tasks
 
-    for t in (task, resume_task, watchdog_task, catchup_task, keeper_task, guard_task):
+
+async def stop_engine_tasks(tasks: list):
+    for t in tasks:
         t.cancel()
         try:
             await t
         except asyncio.CancelledError:
             pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    create_tables()
+    create_master_if_needed()
+
+    # The engine normally lives in its own service (app.worker). This one serves the API.
+    # RUN_ENGINE=1 brings it back into this process — for local development, or to roll
+    # the split back without redeploying the worker.
+    tasks: list = []
+    if run_engine_requested():
+        if acquire_engine_lock():
+            tasks = start_engine_tasks()
+            print("[startup] RUN_ENGINE=1 and engine lock held — the engine runs in THIS process")
+        else:
+            print("[startup] RUN_ENGINE=1 but another process holds the engine lock — serving API only")
+    else:
+        print("[startup] API only — the engine runs in the worker service (uvicorn app.worker:app)")
+
+    yield
+
+    await stop_engine_tasks(tasks)
 
 
 app = FastAPI(
