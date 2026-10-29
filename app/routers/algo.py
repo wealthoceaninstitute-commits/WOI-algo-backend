@@ -681,6 +681,34 @@ async def trigger_algo_run(
         would overwrite the opening prices); anything that hit SL / target meanwhile is closed.
     Runs in background — returns immediately.
     """
+    from app.core.engine_lock import is_engine_process, engine_url, internal_token
+
+    # After the engine was split into its own service, this process usually does NOT
+    # run the engine — forward the kick to the worker instead of starting a second one.
+    if not is_engine_process():
+        base = engine_url()
+        if not base:
+            raise HTTPException(
+                status_code=503,
+                detail="The engine runs in the worker service. Set ENGINE_URL on this "
+                       "service to the worker's URL so this button can reach it.",
+            )
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.post(f"{base}/engine/trigger",
+                                 headers={"x-woi-internal": internal_token()})
+        except Exception as e:
+            raise HTTPException(status_code=502,
+                                detail=f"could not reach the engine worker: {type(e).__name__}: {e}")
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502,
+                                detail=f"engine worker returned {r.status_code}: {r.text[:200]}")
+        return {
+            "message": "Engine kick forwarded to the worker service. Check the run log on this page.",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     from app.services.algo_engine import trigger_or_resume
     background_tasks.add_task(trigger_or_resume)
     return {
@@ -692,8 +720,22 @@ async def trigger_algo_run(
 @router.get("/engine/status")
 async def get_engine_status(_: User = Depends(require_master)):
     """Is the engine alive? seconds since last monitor tick, WebSocket health, live orders in flight."""
+    from app.core.engine_lock import is_engine_process, engine_url
     from app.services.algo_engine import engine_status
-    return engine_status()
+
+    # The counters live in the process that runs the engine, so when that is the
+    # worker service, ask it rather than reporting this process's empty globals.
+    if not is_engine_process() and engine_url():
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=6) as c:
+                r = await c.get(f"{engine_url()}/engine/status")
+            if r.status_code < 400:
+                return {**r.json(), "source": "worker"}
+        except Exception as e:
+            return {"running": False, "source": "worker-unreachable",
+                    "error": f"{type(e).__name__}: {e}"}
+    return {**engine_status(), "source": "this-process"}
 
 
 # ── Debug: price snapshot ─────────────────────────────────────────────────────
