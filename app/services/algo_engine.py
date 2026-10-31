@@ -54,7 +54,7 @@ from app.services.angel_ws import (
     is_ws_connected, ws_stats, stop_ws_stream
 )
 from app.services.master_token import get_master_token, clear_master_token_cache
-from app.services.execution import OrderIntent, PAPER, LIVE, dispatch, wait_pending, live_in_flight
+from app.services.execution import OrderIntent, PAPER, LIVE, dispatch, wait_pending, live_in_flight, arm_entries
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -598,6 +598,8 @@ async def _candle_worker(sid: str, stock_ids: list[str], jwt: str, api_key: str,
         try:
             await asyncio.to_thread(_apply_candle_sync, sid, candle, stock_ids)
             if await asyncio.to_thread(_levels_missing_sync, stock_ids) == 0:
+                if candle:
+                    arm_entries(stock_ids)      # LIVE clients: rest entry stop orders at Dhan now (paper: no-op)
                 return
         except Exception as e:
             print(f"[algo] apply candle {sid} attempt {attempt} failed: {type(e).__name__}: {e}")
@@ -1058,12 +1060,21 @@ def _process_tick(ltp_map: dict) -> TickResult:
                 moved  = (ltp - trig) if direction == "BUY" else (trig - ltp)
                 one_rt = trig * float(strat.sl_pct)
                 moved_r = moved / one_rt if one_rt > 0 else 0.0
-                if strat.missed_guard and moved_r > strat.missed_r:
+                armed    = stock.live_status == "ARMED"
+                is_live  = (not strat.paper) or armed       # a stock armed at Dhan stays on the live route
+                resting  = armed and bool(stock.buy_order_id if direction == "BUY" else stock.sell_order_id)
+                if strat.missed_guard and moved_r > strat.missed_r and not resting:
                     stock.status      = "cancelled"
                     stock.exit_reason = "ENTRY_MISSED"
                     book.log(stock.run_id,
                              f"SKIP {stock.symbol}: {direction} trigger ₹{trig:.2f} is already {moved_r:.1f}R behind "
                              f"LTP ₹{ltp:.2f} (missed-move guard {strat.missed_r:g}R) — entry cancelled")
+                    if is_live:
+                        book.intents.append(OrderIntent(
+                            mode=LIVE, kind="CANCEL", stock_id=stock.id, run_id=stock.run_id,
+                            profile_id=stock.client_profile_id, symbol=stock.symbol,
+                            security_id=sid, side=direction, qty=int(stock.quantity or 1),
+                            reason="ENTRY_MISSED"))
                     continue
 
                 # ── ENTER ─────────────────────────────────────────────────────
@@ -1076,13 +1087,14 @@ def _process_tick(ltp_map: dict) -> TickResult:
                 sl_price  = _trail_levels(stock, ltp, strat, trail_steps)["sl_price"]
                 tgt_price = _target_price(stock, strat)
                 qty       = int(stock.quantity or 1)
-                if strat.paper:
+                if not is_live:
                     mode_label, order_note = "PAPER", ""
                 else:
-                    mode_label, order_note = "LIVE", " | MARKET order → Dhan"
+                    mode_label = "LIVE"
+                    order_note = (" | resting SL-M order at Dhan" if resting else " | MARKET order → Dhan")
                     stock.live_status = "ENTRY_PENDING"     # committed with this tick, before the order is sent
                 book.intents.append(OrderIntent(
-                    mode=PAPER if strat.paper else LIVE,
+                    mode=LIVE if is_live else PAPER,
                     kind="ENTRY", stock_id=stock.id, run_id=stock.run_id,
                     profile_id=stock.client_profile_id, symbol=stock.symbol,
                     security_id=sid, side=direction, qty=qty, signal_price=ltp))
@@ -1229,6 +1241,12 @@ def _eod_apply_sync(ltp_map: dict) -> list[OrderIntent]:
                 stock.status      = "cancelled"
                 stock.exit_reason = "NO_ENTRY"
                 book.log(stock.run_id, f"EOD: {stock.symbol} never triggered — closed without a trade")
+                if stock.live_status == "ARMED" or stock.buy_order_id or stock.sell_order_id:
+                    book.intents.append(OrderIntent(
+                        mode=LIVE, kind="CANCEL", stock_id=stock.id, run_id=stock.run_id,
+                        profile_id=stock.client_profile_id, symbol=stock.symbol,
+                        security_id=str(stock.security_id), side="BUY", qty=int(stock.quantity or 1),
+                        reason="EOD"))
         book.flush()
         return book.intents
     except Exception:
