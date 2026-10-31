@@ -9,7 +9,11 @@ When the engine decides to ENTER or EXIT for a client it creates an OrderIntent 
 calls dispatch(). Each intent goes down that client's route:
 
     mode == "paper"  →  paper.py   simulated: the engine's booked price is the fill
-    mode == "live"   →  live.py    real Dhan MARKET order through the client's static-IP proxy
+    mode == "live"   →  live.py    real Dhan orders through the client's static-IP proxy
+
+Live entries do not wait for the trigger: as soon as the first-candle levels are known
+(9:16) arm_entries() rests STOP_LOSS_MARKET orders at Dhan on the trigger level(s), so the
+exchange fills them the instant price gets there. Paper ignores arming entirely.
 
 A client's route is AlgoStrategy.paper_trading (the Paper / Live badge on the Clients page).
 An exit always takes the route its entry took, so a position opened on paper is never
@@ -25,7 +29,7 @@ LIVE  = "live"
 @dataclass
 class OrderIntent:
     mode: str                    # PAPER | LIVE
-    kind: str                    # "ENTRY" | "EXIT"
+    kind: str                    # "ENTRY" | "EXIT" | "CANCEL" (drop resting entry orders)
     stock_id: str
     run_id: str
     profile_id: str
@@ -46,6 +50,13 @@ def dispatch(intents: list[OrderIntent]):
             live.submit(it)
         else:
             paper.submit(it)
+
+
+def arm_entries(stock_ids: list[str]):
+    """First-candle levels are saved → live clients rest their entry stop orders at Dhan now.
+    Paper has nothing to do here (its entry is booked when the trigger is crossed)."""
+    from app.services.execution import live
+    live.arm(stock_ids)
 
 
 async def wait_pending(timeout: float = 45.0):
