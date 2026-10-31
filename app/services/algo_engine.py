@@ -10,10 +10,13 @@ Trading mode (per client, switchable anytime via UI) — AlgoStrategy.paper_trad
   paper_trading = True  → simulate only, no real orders
   paper_trading = False → place real MARKET orders via Dhan (through the client's static-IP proxy)
 
-PAPER and LIVE clients run side by side in ONE monitor loop:
-  • the loop only does fast, in-memory + one-commit-per-tick work (never waits on a broker),
-  • every LIVE order is handed to its own background task (timeouts, retries, fill check),
-    so a slow / failing Dhan call can never delay anyone's SL / target / entry.
+PAPER and LIVE clients run side by side in ONE monitor loop. This file is the shared
+engine — data, gaps, selection, entry / SL / target / trailing, bookkeeping — identical
+for both. Only EXECUTION differs, and that lives in app/services/execution/:
+  • the engine produces an OrderIntent for every entry / exit and calls dispatch()
+  • paper.py — simulated, nothing leaves the server
+  • live.py  — real Dhan MARKET order in its own background task (timeouts, retries,
+    fill check), so a slow / failing Dhan call can never delay anyone's SL / target / entry.
 
 Reliability:
   • every tick uses a fresh short-lived DB session (a DB hiccup can't poison the loop)
@@ -51,13 +54,7 @@ from app.services.angel_ws import (
     is_ws_connected, ws_stats, stop_ws_stream
 )
 from app.services.master_token import get_master_token, clear_master_token_cache
-from app.services.dhan_trade import (
-    place_order, cancel_order, get_order_by_id, get_positions,
-    find_order_by_correlation, normalize_order,
-)
-from app.services.token_manager import (
-    token_is_valid, get_stored_token, refresh_token, _get_proxy_kwargs,
-)
+from app.services.execution import OrderIntent, PAPER, LIVE, dispatch, wait_pending, live_in_flight
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -140,395 +137,6 @@ def _is_paper(profile: Optional[ClientProfile], strategy: Optional[AlgoStrategy]
         return bool(profile.paper_trading)
     return True
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  LIVE ORDER EXECUTION (Dhan)
-#  Runs in background tasks so it can never delay the monitor loop.
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class LiveIntent:
-    kind: str                    # "ENTRY" | "EXIT"
-    stock_id: str
-    run_id: str
-    profile_id: str
-    symbol: str
-    security_id: str
-    side: str                    # order side: BUY | SELL
-    qty: int
-    reason: str = ""
-    signal_price: float = 0.0    # price the engine saw when it decided
-    verify_position: bool = False  # EOD: check broker position first (it may already be flat)
-
-
-_live_tasks: set = set()
-_entry_tasks: dict[str, asyncio.Task] = {}
-LIVE_ORDER_TIMEOUT   = 12.0
-LIVE_ORDER_ATTEMPTS  = 3
-
-
-def _corr_id(stock_id: str, kind: str) -> str:
-    """≤24 chars, unique per stock+leg — lets us find the order again after a network error."""
-    return stock_id.replace("-", "")[:23] + ("E" if kind == "ENTRY" else "X")
-
-
-def _dispatch_live(intents: list[LiveIntent]):
-    """Fire-and-forget: each order runs in its own task (entry always completes before its exit)."""
-    for it in intents:
-        prior = _entry_tasks.get(it.stock_id) if it.kind == "EXIT" else None
-        task = asyncio.create_task(_run_live_intent(it, prior))
-        _live_tasks.add(task)
-        task.add_done_callback(_live_tasks.discard)
-        if it.kind == "ENTRY":
-            _entry_tasks[it.stock_id] = task
-            task.add_done_callback(lambda _t, sid=it.stock_id: _entry_tasks.pop(sid, None))
-
-
-async def _wait_live_tasks(timeout: float = 45.0):
-    pending = [t for t in list(_live_tasks) if not t.done()]
-    if pending:
-        print(f"[live] waiting for {len(pending)} live order task(s)…")
-        await asyncio.wait(pending, timeout=timeout)
-
-
-def _load_live_ctx(profile_id: str, stock_id: str) -> dict:
-    """Credentials + proxy for one client (worker thread, own session)."""
-    db = SessionLocal()
-    try:
-        profile = db.query(ClientProfile).filter(ClientProfile.id == profile_id).first()
-        cred = profile.dhan_cred if profile else None
-        stock = db.query(AlgoStock).filter(AlgoStock.id == stock_id).first()
-        out = {"live_status": stock.live_status if stock else None}
-        if not profile or not cred:
-            out["error"] = "no Dhan credentials saved for this client"
-            return out
-        try:
-            out["client_id"] = decrypt(cred.dhan_client_id)
-        except Exception:
-            out["error"] = "could not decrypt Dhan client id"
-            return out
-        out["token"]    = get_stored_token(profile)          # DECRYPTED access token
-        out["token_ok"] = bool(out["token"]) and token_is_valid(profile)
-        out["proxy"]    = _get_proxy_kwargs(profile)          # static-IP proxy (SEBI) — must be used for orders
-        return out
-    except Exception as e:
-        return {"error": f"credential load failed: {type(e).__name__}: {e}"}
-    finally:
-        db.close()
-
-
-async def _refresh_live_token(profile_id: str, failed_token: Optional[str]) -> Optional[str]:
-    """Generate a fresh Dhan token (TOTP). Reuses one a parallel task already refreshed."""
-    db = SessionLocal()
-    try:
-        profile = db.query(ClientProfile).filter(ClientProfile.id == profile_id).first()
-        cred = profile.dhan_cred if profile else None
-        if not cred:
-            return None
-        current = get_stored_token(profile)
-        if current and failed_token and current != failed_token:
-            return current                                    # someone else already refreshed
-        client_id = decrypt(cred.dhan_client_id)
-        pin       = decrypt(cred.pin)
-        totp      = decrypt(cred.totp_secret)
-        return await refresh_token(profile, client_id, pin, totp, db,
-                                   reason="forced", **_get_proxy_kwargs(profile))
-    except Exception as e:
-        print(f"[live] token refresh failed for {profile_id}: {type(e).__name__}: {e}")
-        return None
-    finally:
-        db.close()
-
-
-def _retryable(res: dict) -> bool:
-    msg = str(res.get("message", ""))
-    return any(k in msg for k in ("Dhan 5", "Dhan 429", "DH-904", "DH-908", "DH-909", "network", "timeout"))
-
-
-async def _place_with_recovery(it: LiveIntent, ctx: dict, token: str, qty: int) -> dict:
-    """
-    POST the market order. Handles: expired token (refresh once + retry), network errors /
-    timeouts (look the order up by correlationId BEFORE retrying so it is never placed twice),
-    and transient 5xx / rate limits (short retry). Returns {success, order_id, message}.
-    """
-    corr  = _corr_id(it.stock_id, it.kind)
-    proxy = ctx.get("proxy") or {}
-    refreshed = False
-    last = {"success": False, "message": "not attempted"}
-
-    for attempt in range(1, LIVE_ORDER_ATTEMPTS + 1):
-        try:
-            res = await asyncio.wait_for(
-                place_order(
-                    access_token=token,
-                    dhan_client_id=ctx["client_id"],
-                    transaction_type=it.side,
-                    exchange_segment="NSE_EQ",
-                    product_type="INTRADAY",
-                    order_type="MARKET",
-                    security_id=str(it.security_id),
-                    quantity=int(qty),
-                    price=0,
-                    correlation_id=corr,
-                    **proxy,
-                ),
-                timeout=LIVE_ORDER_TIMEOUT,
-            )
-        except Exception as e:
-            # Ambiguous: Dhan may have received it. Check before sending again.
-            try:
-                found = await asyncio.wait_for(find_order_by_correlation(token, corr, **proxy), 8)
-            except Exception:
-                found = None
-            if found:
-                return {"success": True, "order_id": found.get("orderId"), "message": "recovered via correlationId"}
-            last = {"success": False, "message": f"network error ({type(e).__name__}: {e})"}
-            await asyncio.sleep(0.4)
-            continue
-
-        if res.get("success"):
-            oid = res.get("order_id") or (res.get("data") or {}).get("orderId")
-            return {"success": True, "order_id": oid, "message": ""}
-
-        if res.get("token_expired") and not refreshed:
-            refreshed = True
-            new = await _refresh_live_token(it.profile_id, token)
-            if new:
-                token = new
-                continue
-            return {"success": False, "message": "Dhan token expired and automatic refresh failed"}
-
-        last = {"success": False, "message": res.get("message") or str(res)}
-        if _retryable(last) and attempt < LIVE_ORDER_ATTEMPTS:
-            await asyncio.sleep(0.5 * attempt)
-            continue
-        break
-
-    return last
-
-
-async def _poll_fill(token: str, proxy: dict, order_id: str) -> dict:
-    """Short poll of the order status → actual average fill price (≈ a few seconds max)."""
-    last: dict = {}
-    for i in range(8):
-        await asyncio.sleep(0.25 if i == 0 else 0.5)
-        try:
-            res = await asyncio.wait_for(get_order_by_id(token, order_id, **proxy), 6)
-        except Exception:
-            continue
-        if not res.get("success"):
-            continue
-        d = res.get("data")
-        if isinstance(d, list):
-            d = d[0] if d else {}
-        if not isinstance(d, dict) or not d:
-            continue
-        last = normalize_order(d)
-        if last["status"] in ("EXECUTED", "REJECTED", "CANCELLED"):
-            break
-    return {
-        "status": last.get("status", "UNKNOWN"),
-        "avg":    float(last.get("executed_price") or 0),
-        "filled": int(last.get("filled_qty") or 0),
-        "reason": last.get("rejection_reason"),
-    }
-
-
-async def _broker_position_qty(token: str, proxy: dict, security_id: str, timeout: float = 8.0) -> Optional[int]:
-    """Signed net quantity the broker holds for this security today (None = could not tell)."""
-    try:
-        res = await asyncio.wait_for(get_positions(token, **proxy), timeout)
-    except Exception:
-        return None
-    if not res.get("success"):
-        return None
-    data = res.get("data")
-    if not isinstance(data, list):
-        return None
-    for p in data:
-        if str(p.get("securityId")) == str(security_id) and str(p.get("productType", "INTRADAY")) in ("INTRADAY", "MIS"):
-            try:
-                return int(p.get("netQty") or 0)
-            except Exception:
-                return None
-    return 0
-
-
-def _live_note(it: LiveIntent, msg: str):
-    _log_runs_sync([it.run_id], msg)
-
-
-def _live_record_success(it: LiveIntent, order_id: str, fill: dict, qty: int):
-    """Persist order id / status / fill; log one clear line. (worker thread)"""
-    db = SessionLocal()
-    try:
-        stock = db.query(AlgoStock).filter(AlgoStock.id == it.stock_id).first()
-        if not stock:
-            return
-        avg = fill.get("avg") or 0.0
-        slip = ""
-        if avg > 0 and it.signal_price > 0:
-            slip = f" | signal ₹{it.signal_price:.2f} → fill ₹{avg:.2f} (slip {avg - it.signal_price:+.2f})"
-        st = fill.get("status", "UNKNOWN")
-        if it.kind == "ENTRY":
-            if it.side == "BUY":
-                stock.buy_order_id = str(order_id)
-            else:
-                stock.sell_order_id = str(order_id)
-            stock.live_status = "ENTRY_OK"
-            if avg > 0:
-                stock.live_entry_price = avg
-        else:
-            if it.side == "BUY":
-                stock.buy_order_id = str(order_id)
-            else:
-                stock.sell_order_id = str(order_id)
-            stock.live_status = "EXIT_OK"
-            if avg > 0:
-                stock.live_exit_price = avg
-        _append_run_log(db, it.run_id, [
-            f"[{_stamp()}] LIVE {it.kind} {it.side} {it.symbol} x{qty} @ MKT ✓ order_id={order_id} "
-            f"status={st}{(' filled ' + str(fill.get('filled'))) if fill.get('filled') else ''}{slip}"
-            f"{(' [' + it.reason + ']') if it.reason else ''}"
-        ])
-        db.commit()
-        print(f"[live] {it.kind} {it.side} {it.symbol} x{qty} OK order_id={order_id} status={st} avg={avg}")
-    except Exception as e:
-        print(f"[live] record_success failed: {type(e).__name__}: {e}")
-        db.rollback()
-    finally:
-        db.close()
-
-
-def _live_record_failure(it: LiveIntent, msg: str):
-    """
-    ENTRY failed  → nothing was bought/sold at the broker: cancel this client's trade so the
-                    algo does not track (or later try to "exit") a position that does not exist.
-    EXIT failed   → the broker position may still be OPEN: flag it loudly.
-    """
-    db = SessionLocal()
-    try:
-        stock = db.query(AlgoStock).filter(AlgoStock.id == it.stock_id).first()
-        if not stock:
-            return
-        if it.kind == "ENTRY":
-            stock.live_status = "ENTRY_FAILED"
-            if stock.status in ("entered", "exited"):
-                was_exited = stock.status == "exited"
-                pnl = float(stock.pnl or 0) if was_exited else 0.0
-                stock.status      = "cancelled"
-                stock.exit_reason = "ENTRY_FAILED"
-                stock.pnl         = 0
-                db.execute(update(AlgoRun).where(AlgoRun.id == it.run_id).values(
-                    stocks_traded=case((AlgoRun.stocks_traded > 0, AlgoRun.stocks_traded - 1), else_=0),
-                    total_pnl=func.coalesce(AlgoRun.total_pnl, 0) - pnl))
-                if was_exited and pnl:       # exited within the same second: undo its (virtual) P&L
-                    drow = db.query(DailyPnl).filter(
-                        DailyPnl.client_profile_id == it.profile_id,
-                        DailyPnl.date == date.today()).first()
-                    if drow:
-                        drow.closed_pnl  = float(drow.closed_pnl or 0) - pnl
-                        drow.total_pnl   = float(drow.total_pnl or 0) - pnl
-                        drow.trade_count = max(0, (drow.trade_count or 0) - 1)
-            line = (f"[{_stamp()}] LIVE ENTRY FAILED {it.side} {it.symbol} x{it.qty}: {msg} "
-                    f"— NO position opened at the broker; trade cancelled for this client")
-        else:
-            stock.live_status = "EXIT_FAILED"
-            line = (f"[{_stamp()}] ⚠ LIVE EXIT FAILED {it.side} {it.symbol} x{it.qty} [{it.reason}]: {msg} "
-                    f"— POSITION MAY STILL BE OPEN AT THE BROKER, CLOSE IT MANUALLY")
-        _append_run_log(db, it.run_id, [line])
-        db.commit()
-        print(f"[live] {line}")
-    except Exception as e:
-        print(f"[live] record_failure failed: {type(e).__name__}: {e}")
-        db.rollback()
-    finally:
-        db.close()
-
-
-async def _execute_live_order(it: LiveIntent):
-    ctx = await asyncio.to_thread(_load_live_ctx, it.profile_id, it.stock_id)
-
-    # An exit only makes sense if the matching entry really went through at the broker.
-    # (Positions that were opened as paper-only — e.g. before a client was switched to
-    # live — must never send a real order: a SELL with no position opens a fresh SHORT.)
-    if it.kind == "EXIT" and ctx.get("live_status") not in ("ENTRY_OK", "ENTRY_PENDING"):
-        await asyncio.to_thread(
-            _live_note, it,
-            f"LIVE EXIT {it.symbol} skipped — no live entry order for this trade "
-            f"(live_status={ctx.get('live_status')}); nothing to close at the broker")
-        return
-
-    if ctx.get("error"):
-        await asyncio.to_thread(_live_record_failure, it, ctx["error"])
-        return
-
-    token = ctx.get("token")
-    if not ctx.get("token_ok"):
-        token = await _refresh_live_token(it.profile_id, token)
-    if not token:
-        await asyncio.to_thread(_live_record_failure, it, "no valid Dhan access token (refresh failed — check PIN/TOTP)")
-        return
-
-    qty = it.qty
-    if it.kind == "EXIT":
-        # Never close more than the broker really holds, and never open a fresh opposite
-        # position: if the trade was already closed (manually in the Dhan app, broker auto
-        # square-off, or never filled) skip the order. For SL / target the lookup is capped at
-        # 2.5s so it cannot meaningfully delay the exit; at EOD we can afford to wait longer.
-        net = await _broker_position_qty(token, ctx.get("proxy") or {}, it.security_id,
-                                         timeout=8.0 if it.reason == "EOD" else 2.5)
-        if net is not None:
-            want_close = (net > 0 and it.side == "SELL") or (net < 0 and it.side == "BUY")
-            if net == 0 or not want_close:
-                await asyncio.to_thread(
-                    _live_note, it,
-                    f"LIVE EXIT {it.symbol} skipped — broker net qty is {net} (already flat / closed manually)")
-                db = SessionLocal()
-                try:
-                    s = db.query(AlgoStock).filter(AlgoStock.id == it.stock_id).first()
-                    if s:
-                        s.live_status = "EXIT_OK"
-                        db.commit()
-                finally:
-                    db.close()
-                return
-            qty = min(abs(net), it.qty)
-
-    res = await _place_with_recovery(it, ctx, token, qty)
-    if not res.get("success"):
-        await asyncio.to_thread(_live_record_failure, it, res.get("message") or "order rejected")
-        return
-
-    order_id = res.get("order_id")
-    fill = await _poll_fill(token, ctx.get("proxy") or {}, order_id) if order_id else {"status": "UNKNOWN", "avg": 0.0}
-
-    if fill.get("status") in ("REJECTED", "CANCELLED"):        # accepted by Dhan, refused by the exchange / RMS
-        await asyncio.to_thread(
-            _live_record_failure, it,
-            f"order {order_id} {fill['status']}: {fill.get('reason') or 'no reason given'}")
-        return
-
-    await asyncio.to_thread(_live_record_success, it, order_id, fill, qty)
-
-
-async def _run_live_intent(it: LiveIntent, prior: Optional[asyncio.Task]):
-    try:
-        if prior is not None and not prior.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(prior), 20)
-            except Exception:
-                pass
-        await _execute_live_order(it)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[live] unexpected error for {it.kind} {it.symbol}: {e}\n{tb}")
-        try:
-            await asyncio.to_thread(_live_record_failure, it, f"internal error {type(e).__name__}: {e}")
-        except Exception:
-            pass
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -739,26 +347,35 @@ def cleanup_old_snapshots(db: Session):
     print(f"[snapshot] Cleaned up {deleted} old snapshot rows (before today)")
 
 
-# ── Step 1: 8:45 AM — fetch LTP as prev close, save to DB ────────────────────
+# ── Step 1: 8:45 AM — fetch PREVIOUS CLOSE, save to DB ────────────────────────
+#
+# Uses the FULL quote's `close` field (= NSE "previous close") — correct at ANY
+# time of day. Storing LTP as prev close is only right before 9:00: after the
+# pre-open auction (9:08) LTP is TODAY's open, so a late start made every gap ~0%.
 
 async def _fetch_and_save_prev_close(
     jwt: str, api_key: str, master_client_id: str, universe: list[dict], db: Session
 ) -> int:
-    """Fetch LTP for all universe stocks, save as prev_close to DB. Returns count saved."""
+    """Fetch previous close for all universe stocks, save to DB. Returns count saved."""
     sec_ids = [u["security_id"] for u in universe]
-    print(f"[algo] Fetching prev close LTP for {len(sec_ids)} stocks in {(len(sec_ids)+899)//900} batch(es)...")
+    print(f"[algo] Fetching previous close (FULL quote) for {len(sec_ids)} stocks...")
 
-    snapshot: dict[str, float] = {}
-    for i in range(0, len(sec_ids), 900):
-        batch  = sec_ids[i:i+900]
-        prices = await angel_fetch_ltp(jwt, api_key, master_client_id, batch)
-        snapshot.update(prices)
-        print(f"[algo] Batch {i//900 + 1}: got {len(prices)} prices")
-        if i + 900 < len(sec_ids):
-            await asyncio.sleep(1.1)
+    quotes = await angel_fetch_full_quote(jwt, api_key, master_client_id, sec_ids)
 
-    valid = {k: v for k, v in snapshot.items() if v and v > 0}
-    print(f"[algo] Prev close fetched: {len(valid)} valid / {len(sec_ids)} total")
+    pre_open = datetime.now(IST).hour < 9
+    valid: dict[str, float] = {}
+    from_close = from_ltp = 0
+    for sid, q in quotes.items():
+        close = q.get("close") or 0
+        if close > 0:
+            valid[sid] = close
+            from_close += 1
+        elif pre_open and (q.get("ltp") or 0) > 0:
+            valid[sid] = q["ltp"]          # before 9:00 LTP is still yesterday's close
+            from_ltp += 1
+
+    print(f"[algo] Prev close fetched: {len(valid)} valid / {len(sec_ids)} total "
+          f"(close={from_close}, ltp-fallback={from_ltp})")
 
     _upsert_prev_close(valid, universe, db)
     return len(valid)
@@ -1301,7 +918,7 @@ class _Book:
         self.logs: dict[str, list[str]] = {}
         self.traded: dict[str, int]     = {}
         self.pnl: dict[str, float]      = {}
-        self.intents: list[LiveIntent]  = []
+        self.intents: list[OrderIntent] = []
         self._daily: dict[str, DailyPnl] = {}
 
     def log(self, run_id: str, msg: str):
@@ -1325,7 +942,7 @@ class _Book:
 
     def exit(self, stock: AlgoStock, strat, reason: str, fill: float, ltp: float,
              verify_position: bool = False, when: Optional[datetime] = None, note: str = ""):
-        """Close one position (algo bookkeeping) and queue the broker order if it is a real one."""
+        """Close one position (shared bookkeeping) and queue the exit on the route its ENTRY took."""
         pnl   = _calc_pnl(stock, fill)
         entry = float(stock.entry_price)
         one_r = entry * float(strat.sl_pct)
@@ -1345,14 +962,14 @@ class _Book:
                  f"| entry=₹{entry:.2f} | P&L=₹{pnl:+.2f} | R:R={rr:+.2f}R{note}")
         self.add_daily(stock.client_profile_id, pnl)
 
-        if live_pos:
-            self.intents.append(LiveIntent(
-                kind="EXIT", stock_id=stock.id, run_id=stock.run_id, profile_id=stock.client_profile_id,
-                symbol=stock.symbol, security_id=str(stock.security_id),
-                side="SELL" if stock.entry_direction == "BUY" else "BUY",
-                qty=int(stock.quantity or 1), reason=reason, signal_price=ltp,
-                verify_position=True))
-        elif not strat.paper:
+        self.intents.append(OrderIntent(
+            mode=LIVE if live_pos else PAPER,
+            kind="EXIT", stock_id=stock.id, run_id=stock.run_id, profile_id=stock.client_profile_id,
+            symbol=stock.symbol, security_id=str(stock.security_id),
+            side="SELL" if stock.entry_direction == "BUY" else "BUY",
+            qty=int(stock.quantity or 1), reason=reason, signal_price=ltp,
+            verify_position=True))
+        if not live_pos and not strat.paper:
             self.log(stock.run_id,
                      f"LIVE client: {stock.symbol} has no broker position for this trade — exit recorded in the algo only, no order sent")
 
@@ -1463,11 +1080,12 @@ def _process_tick(ltp_map: dict) -> TickResult:
                     mode_label, order_note = "PAPER", ""
                 else:
                     mode_label, order_note = "LIVE", " | MARKET order → Dhan"
-                    stock.live_status = "ENTRY_PENDING"
-                    book.intents.append(LiveIntent(
-                        kind="ENTRY", stock_id=stock.id, run_id=stock.run_id,
-                        profile_id=stock.client_profile_id, symbol=stock.symbol,
-                        security_id=sid, side=direction, qty=qty, signal_price=ltp))
+                    stock.live_status = "ENTRY_PENDING"     # committed with this tick, before the order is sent
+                book.intents.append(OrderIntent(
+                    mode=PAPER if strat.paper else LIVE,
+                    kind="ENTRY", stock_id=stock.id, run_id=stock.run_id,
+                    profile_id=stock.client_profile_id, symbol=stock.symbol,
+                    security_id=sid, side=direction, qty=qty, signal_price=ltp))
                 book.log(stock.run_id,
                          f"{mode_label} {direction} {stock.symbol} @ ₹{ltp:.2f} "
                          f"| trigger=₹{trig:.2f} | SL=₹{sl_price:.2f} | target=₹{tgt_price:.2f} "
@@ -1588,7 +1206,7 @@ def _eod_collect_sync() -> list[str]:
     return sorted(_active_sids_sync())
 
 
-def _eod_apply_sync(ltp_map: dict) -> list[LiveIntent]:
+def _eod_apply_sync(ltp_map: dict) -> list[OrderIntent]:
     db = SessionLocal()
     try:
         today  = date.today()
@@ -1637,7 +1255,7 @@ async def _force_exit_all(jwt: str, api_key: str, client_id: str):
         except Exception as e:
             print(f"[algo] EOD REST LTP failed: {type(e).__name__}: {e}")
     intents = await asyncio.to_thread(_eod_apply_sync, ltp_map)
-    _dispatch_live(intents)
+    dispatch(intents)
 
 
 # ── Heartbeat / finish ────────────────────────────────────────────────────────
@@ -1894,7 +1512,7 @@ async def _recover_outage(run_ids: list[str], jwt: str, api_key: str, client_id:
     if _dispatch_later:
         pending = list(_dispatch_later)
         _dispatch_later.clear()
-        _dispatch_live(pending)
+        dispatch(pending)
     print(f"[algo] Outage recovery: {closed} position(s) closed from {len(cands)} checked")
 
 
@@ -1951,7 +1569,7 @@ async def _monitor_and_finish(run_ids: list[str], now_ist: datetime, background:
                     res = await asyncio.wait_for(asyncio.to_thread(_process_tick, ltp_map), 20)
                     active_sids = res.active_sids
                     if res.intents:
-                        _dispatch_live(res.intents)
+                        dispatch(res.intents)
                     if res.open_count == 0:
                         await asyncio.to_thread(
                             _log_runs_sync, run_ids, "All positions closed — stopping monitor loop early")
@@ -2008,7 +1626,7 @@ async def _monitor_and_finish(run_ids: list[str], now_ist: datetime, background:
         except Exception as e:
             print(f"[algo] EOD force exit error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
-        await _wait_live_tasks(45)
+        await wait_pending(45)
         await asyncio.to_thread(_finish_runs_sync, run_ids)
     finally:
         _monitor_active = False
@@ -2218,7 +1836,7 @@ def engine_status() -> dict:
         "monitor_started_at":   _monitor_started_at.isoformat() if _monitor_started_at else None,
         "last_tick_ago_secs":   round(now - _monitor_last_tick, 1) if _monitor_last_tick else None,
         "tick_errors":          _monitor_errors,
-        "live_orders_in_flight": len([t for t in _live_tasks if not t.done()]),
+        "live_orders_in_flight": live_in_flight(),
         "ws":                   ws_stats(),
     }
 
@@ -2231,16 +1849,8 @@ def _log_mode(run: AlgoRun, profile: ClientProfile, strategy: AlgoStrategy, db: 
         _log(run, "Mode: PAPER — simulated trades only, no orders are sent", db)
     else:
         _log(run, "Mode: LIVE — real MARKET orders will be sent to Dhan", db)
-        problems = []
-        cred = profile.dhan_cred
-        if not cred:
-            problems.append("no Dhan credentials saved")
-        elif not token_is_valid(profile):
-            problems.append("Dhan access token is expired — will be refreshed (TOTP) when the first order is sent")
-        px = profile.proxy_setting
-        if not px or not px.is_active:
-            problems.append("no static-IP proxy configured — Dhan will reject orders that don't come from the registered IP")
-        for pr in problems:
+        from app.services.execution.live import preflight_problems
+        for pr in preflight_problems(profile):
             _log(run, f"LIVE pre-flight warning: {pr}", db)
     if profile.paper_trading != strategy.paper_trading:
         _log(run, f"Note: profile flag paper_trading={profile.paper_trading} differs from algo flag "
@@ -2348,10 +1958,15 @@ async def run_daily_algo():
         else:
             print(f"[algo] Prev close already in DB ({existing} rows) — skipping fetch")
 
+        prev_in_db = db.query(DailyPriceSnapshot).filter(
+            DailyPriceSnapshot.trade_date == date.today(),
+            DailyPriceSnapshot.prev_close != None,
+        ).count()
+
         # Log once to each client's run (summary only)
         for _, (run, _) in runs.items():
             _log_separator(run, "STEP 1: PREV CLOSE SNAPSHOT", db)
-            _log(run, f"Master: prev close snapshot done — {max(existing, 0)} stocks in DB", db)
+            _log(run, f"Master: prev close snapshot done — {prev_in_db} stocks in DB", db)
 
         # ── STEP 2: 9:12:30 — opening price → DB → compute gaps ────────
         print("[algo] ─── STEP 2: OPENING PRICE SCAN (9:12:30) ───")
