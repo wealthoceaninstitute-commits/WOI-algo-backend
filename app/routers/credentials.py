@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
@@ -14,7 +15,7 @@ from app.schemas.credentials import (
     ProxyRequest,
     ProxyResponse,
 )
-from app.services.dhan import test_dhan_connection
+from app.services.dhan import test_dhan_connection, proxy_egress_ip
 
 router = APIRouter(prefix="/api/credentials", tags=["credentials"])
 
@@ -218,7 +219,8 @@ def save_proxy(
         proxy.host          = payload.host
         proxy.port          = payload.port
         proxy.username      = payload.username
-        proxy.password      = enc_pass
+        if enc_pass:                       # blank password field = keep the saved one
+            proxy.password  = enc_pass
         proxy.is_active     = True
         proxy.set_by_master = is_master
     else:
@@ -265,6 +267,29 @@ def get_proxy(
         is_active=p.is_active,
         set_by_master=p.set_by_master,
     )
+
+
+@router.get("/proxy/ip")
+async def get_proxy_ip(
+    client_profile_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Connect out through this client's saved proxy and report the public IP the world sees.
+    That IP must be the Static IP whitelisted in Dhan, or orders fail with DH-905 "Invalid IP".
+    """
+    if current_user.role == "MASTER" and client_profile_id:
+        profile = _get_profile_by_id(client_profile_id, db)
+    else:
+        profile = _get_profile(current_user, db)
+    p = profile.proxy_setting
+    if not p or not p.is_active:
+        raise HTTPException(status_code=404, detail="No proxy configured")
+    res = await proxy_egress_ip(**_proxy_kwargs(p))
+    res["proxy"] = f"{p.scheme or 'https'}://{p.host}:{p.port}"
+    res["checked_at"] = datetime.now(timezone.utc).isoformat()
+    return res
 
 
 @router.delete("/proxy", status_code=204)
