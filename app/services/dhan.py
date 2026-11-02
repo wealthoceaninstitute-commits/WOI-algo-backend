@@ -195,9 +195,21 @@ async def test_dhan_connection(
                     or data.get("net")
                     or 0.0
                 )
+                # Orders need the static IP whitelisted at Dhan (else DH-905 "Invalid IP"); the fund
+                # check above does not. Report the IP this proxy really exits from so it can be compared.
+                egress = "unknown"
+                try:
+                    ip_r = await client.get("https://api.ipify.org", timeout=8)
+                    if ip_r.status_code == 200:
+                        egress = ip_r.text.strip()[:45]
+                except Exception as e:
+                    egress = f"unknown ({type(e).__name__})"
+                via = f"proxy {proxy_host}" if proxy_host else "NO proxy (Railway's own IP)"
                 return {
                     "success": True,
-                    "message": "Connected to Dhan API. Token valid.",
+                    "message": (f"Connected to Dhan API. Token valid. Orders will be sent from IP {egress} "
+                                f"via {via} — this must be the Static IP saved in Dhan (Profile → DhanHQ "
+                                f"Trading APIs), otherwise orders fail with DH-905 Invalid IP."),
                     "dhan_client_id": dhan_client_id,
                     "fund_limit": float(fund),
                     "access_token": access_token,
