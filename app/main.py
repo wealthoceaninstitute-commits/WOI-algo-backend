@@ -167,17 +167,31 @@ async def lifespan(app: FastAPI):
     # RUN_ENGINE=1 brings it back into this process — for local development, or to roll
     # the split back without redeploying the worker.
     tasks: list = []
+    role_task = None
     if run_engine_requested():
-        if acquire_engine_lock():
-            tasks = start_engine_tasks()
-            print("[startup] RUN_ENGINE=1 and engine lock held — the engine runs in THIS process")
-        else:
-            print("[startup] RUN_ENGINE=1 but another process holds the engine lock — serving API only")
+        # During a Railway deploy the OLD container still holds the engine lock for a while.
+        # Keep trying (every 10 s) instead of giving up once — otherwise, when the old
+        # container stops, nobody runs the engine (that silently skipped the 8:00 / 8:45 jobs).
+        async def _take_engine_role():
+            attempt = 0
+            while True:
+                if await asyncio.to_thread(acquire_engine_lock):
+                    tasks.extend(start_engine_tasks())
+                    print("[startup] RUN_ENGINE=1 and engine lock held — the engine runs in THIS process")
+                    return
+                if attempt == 0:
+                    print("[startup] RUN_ENGINE=1 but another process holds the engine lock — "
+                          "retrying every 10 s until it is released")
+                attempt += 1
+                await asyncio.sleep(10)
+        role_task = asyncio.create_task(_take_engine_role())
     else:
         print("[startup] API only — the engine runs in the worker service (uvicorn app.worker:app)")
 
     yield
 
+    if role_task is not None and not role_task.done():
+        role_task.cancel()
     await stop_engine_tasks(tasks)
 
 
