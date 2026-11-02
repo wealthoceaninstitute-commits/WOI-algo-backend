@@ -53,6 +53,31 @@ def _api_client(
     )
 
 
+async def proxy_egress_ip(
+    proxy_scheme: str = "https",
+    proxy_host: Optional[str] = None,
+    proxy_port: int = 443,
+    proxy_user: Optional[str] = None,
+    proxy_pass: Optional[str] = None,
+) -> dict:
+    """The public IP our requests leave from through this proxy — the IP to whitelist at Dhan."""
+    proxy = _proxy_url(proxy_scheme, proxy_host, proxy_port, proxy_user, proxy_pass) if proxy_host else None
+    last = ""
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            async with httpx.AsyncClient(
+                proxies={"http://": proxy, "https://": proxy} if proxy else None, timeout=12,
+            ) as c:
+                r = await c.get(url, headers={"Accept": "text/plain"})
+            ip = r.text.strip()
+            if r.status_code == 200 and ip and len(ip) <= 45 and " " not in ip:
+                return {"ip": ip, "via_proxy": bool(proxy_host), "error": None}
+            last = f"{url} returned {r.status_code}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {str(e)[:150]}"
+    return {"ip": None, "via_proxy": bool(proxy_host), "error": f"could not reach the internet through this proxy ({last})"}
+
+
 def _generate_totp(totp_secret: str) -> str:
     return pyotp.TOTP(totp_secret).now()
 
