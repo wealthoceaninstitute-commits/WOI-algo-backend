@@ -13,7 +13,9 @@ calls dispatch(). Each intent goes down that client's route:
 
 Live entries do not wait for the trigger: as soon as the first-candle levels are known
 (9:16) arm_entries() rests STOP_LOSS_MARKET orders at Dhan on the trigger level(s), so the
-exchange fills them the instant price gets there. Paper ignores arming entirely.
+exchange fills them the instant price gets there. When one side fills, the other is cancelled
+and a protective stop-loss order is placed at Dhan at the SL level; the trailing SL moves it.
+Paper ignores all of this — it books entries / exits at the engine's prices as before.
 
 A client's route is AlgoStrategy.paper_trading (the Paper / Live badge on the Clients page).
 An exit always takes the route its entry took, so a position opened on paper is never
@@ -29,7 +31,7 @@ LIVE  = "live"
 @dataclass
 class OrderIntent:
     mode: str                    # PAPER | LIVE
-    kind: str                    # "ENTRY" | "EXIT" | "CANCEL" (drop resting entry orders)
+    kind: str                    # "ENTRY" | "EXIT" | "CANCEL" (drop resting entry orders) | "SL_UPDATE" (trail the broker stop)
     stock_id: str
     run_id: str
     profile_id: str
@@ -40,6 +42,7 @@ class OrderIntent:
     reason: str = ""
     signal_price: float = 0.0    # price the engine saw when it decided
     verify_position: bool = False  # EOD: check broker position first (it may already be flat)
+    stop_price: float = 0.0      # live: protective stop-loss level (ENTRY: initial SL, SL_UPDATE: trailed SL)
 
 
 def dispatch(intents: list[OrderIntent]):
