@@ -14,7 +14,7 @@ Safety rules kept from the engine:
   • a failed ENTRY cancels that client's trade; a failed EXIT is flagged loudly
 
 Entry orders are placed AHEAD of the trigger (arm): the moment the 9:16 first-candle levels
-are saved, each live stock gets a STOP_LOSS_MARKET order resting at Dhan on its trigger —
+are saved, each live stock gets a STOP_LOSS (SL-Limit, limit 1 tick beyond) order resting at Dhan on its trigger —
 BUY at buy_trigger and/or SELL at sell_trigger (one side only with gap-direction bias). The
 exchange fills it the instant price reaches the level, so no entry is lost or chased.
   • when the engine sees the trigger crossed, the ENTRY intent picks up that resting order's
@@ -35,7 +35,7 @@ from app.core.database import EngineSessionLocal as SessionLocal
 from app.core.encryption import decrypt
 from app.models.trading import ClientProfile, AlgoRun, AlgoStock, AlgoStrategy, DailyPnl
 from app.services.dhan_trade import (
-    place_order, cancel_order, get_order_by_id, get_positions, find_order_by_correlation, normalize_order,
+    place_order, cancel_order, modify_order, get_order_by_id, get_positions, find_order_by_correlation, normalize_order,
 )
 from app.services.token_manager import (
     token_is_valid, get_stored_token, refresh_token, _get_proxy_kwargs,
@@ -61,10 +61,12 @@ _entry_tasks: dict[str, asyncio.Task] = {}
 _arm_tasks:   dict[str, asyncio.Task] = {}
 LIVE_ORDER_TIMEOUT   = 12.0
 LIVE_ORDER_ATTEMPTS  = 3
-ARM_ORDER_TYPE       = "STOP_LOSS_MARKET"   # resting entry order type at Dhan
+ARM_ORDER_TYPE       = "STOP_LOSS"          # stop order type at Dhan: SL-Limit (Dhan accepts it; SL-M is refused)
+STOP_LIMIT_TICKS     = 1                    # SL-Limit price = trigger ± 1 tick (NSE price-band tick)
 ARMED_FILL_WAIT      = 12                   # polls (~0.5 s each) for a triggered resting order to show TRADED
 ORDER_SPACING        = 0.12                 # seconds between order calls per client (Dhan: 10/s)
 
+_sl_sent:    dict[str, float] = {}   # stock_id → last protective-SL trigger sent (dedupes SL_UPDATE)
 _rate_last:  dict[str, float] = {}
 _rate_locks: dict[str, asyncio.Lock] = {}
 
@@ -83,13 +85,20 @@ def _corr_id(stock_id: str, kind: str, side: str = "") -> str:
     base = stock_id.replace("-", "")
     if kind == "ARM":
         return base[:22] + "A" + (side[:1] or "X")
+    if kind == "STOP":
+        return base[:22] + "PS"
     return base[:23] + ("E" if kind == "ENTRY" else "X")
 
 
 def submit(it: OrderIntent):
     """Fire-and-forget: the order runs in its own task (an entry always completes before its exit;
     an entry / cancel always waits for that stock's arming to finish)."""
-    if it.kind == "EXIT":
+    if it.kind == "SL_UPDATE":
+        last = _sl_sent.get(it.stock_id)
+        if not it.stop_price or (last is not None and abs(last - it.stop_price) < 0.005):
+            return                                   # unchanged — sent every tick, acted on only when it moves
+        _sl_sent[it.stock_id] = it.stop_price
+    if it.kind in ("EXIT", "SL_UPDATE"):
         prior = _entry_tasks.get(it.stock_id)
     else:
         prior = _arm_tasks.get(it.stock_id)
@@ -170,9 +179,9 @@ def _retryable(res: dict) -> bool:
 
 async def _place_with_recovery(it: OrderIntent, ctx: dict, token: str, qty: int,
                                order_type: str = "MARKET", trigger: float = 0.0,
-                               corr: Optional[str] = None) -> dict:
+                               corr: Optional[str] = None, price: float = 0.0) -> dict:
     """
-    POST the order (MARKET, or a resting STOP_LOSS_MARKET when arming). Handles: expired token (refresh once + retry), network errors /
+    POST the order (MARKET, or a resting STOP_LOSS stop order). Handles: expired token (refresh once + retry), network errors /
     timeouts (look the order up by correlationId BEFORE retrying so it is never placed twice),
     and transient 5xx / rate limits (short retry). Returns {success, order_id, message}.
     """
@@ -194,7 +203,7 @@ async def _place_with_recovery(it: OrderIntent, ctx: dict, token: str, qty: int,
                     order_type=order_type,
                     security_id=str(it.security_id),
                     quantity=int(qty),
-                    price=0,
+                    price=float(price or 0),
                     trigger_price=float(trigger or 0),
                     correlation_id=corr,
                     **proxy,
@@ -389,6 +398,8 @@ async def _execute_live_order(it: OrderIntent):
     if it.kind == "CANCEL" and not (ctx.get("buy_oid") or ctx.get("sell_oid")):
         return                                             # nothing resting at the broker
 
+    if it.kind == "SL_UPDATE" and (ctx.get("error") or ctx.get("live_status") != "ENTRY_OK"):
+        return                                             # nothing to trail; never a failure
     if ctx.get("error"):
         if it.kind == "CANCEL":
             await asyncio.to_thread(_live_note, it, f"⚠ LIVE: could not cancel resting orders for {it.symbol}: "
@@ -401,6 +412,8 @@ async def _execute_live_order(it: OrderIntent):
     if not ctx.get("token_ok"):
         token = await _refresh_live_token(it.profile_id, token)
     if not token:
+        if it.kind == "SL_UPDATE":
+            return
         if it.kind == "CANCEL":
             await asyncio.to_thread(_live_note, it, f"⚠ LIVE: no valid Dhan token — could not cancel resting orders "
                                                     f"for {it.symbol}; CANCEL THEM IN THE DHAN APP")
@@ -413,6 +426,30 @@ async def _execute_live_order(it: OrderIntent):
         await _disarm(it, ctx, token, proxy)
         return
 
+    if it.kind == "SL_UPDATE":
+        await _trail_protective(it, ctx, token, proxy)
+        return
+
+    if it.kind == "EXIT":
+        # The protective stop at Dhan sits on the exit side. SL exit → its fill IS the exit;
+        # any other exit (target / EOD / recovery) → cancel it first, then close at market.
+        prot = ctx.get("buy_oid") if it.side == "BUY" else ctx.get("sell_oid")
+        if prot:
+            if it.reason == "SL":
+                f = await _poll_fill(token, proxy, prot, rounds=ARMED_FILL_WAIT)
+                if f["status"] == "EXECUTED":
+                    _sl_sent.pop(it.stock_id, None)
+                    await asyncio.to_thread(_live_record_success, it, prot, f, f.get("filled") or it.qty, "SL (at Dhan)")
+                    return
+            c = await _cancel_resting(it.profile_id, token, proxy, prot)
+            _sl_sent.pop(it.stock_id, None)
+            if c["status"] == "EXECUTED" or c["filled"]:
+                await asyncio.to_thread(_live_record_success, it, prot,
+                                        {"status": "EXECUTED", "avg": c["avg"], "filled": c["filled"]},
+                                        c["filled"] or it.qty, "SL (at Dhan)")
+                return
+            # cancelled (or unknown) → the broker net-position check below decides what is left to close
+
     if it.kind == "ENTRY":
         mine  = ctx.get("buy_oid")  if it.side == "BUY" else ctx.get("sell_oid")
         other = ctx.get("sell_oid") if it.side == "BUY" else ctx.get("buy_oid")
@@ -423,6 +460,8 @@ async def _execute_live_order(it: OrderIntent):
             done = await _take_resting_fill(it, token, proxy, mine)
         if other_task is not None:
             o = await other_task
+            if o.get("status") == "CANCELLED" and not o.get("filled"):
+                await asyncio.to_thread(_set_order_col, it.stock_id, "SELL" if it.side == "BUY" else "BUY", None)
             if o.get("filled"):
                 await asyncio.to_thread(
                     _live_note, it,
@@ -474,6 +513,104 @@ async def _execute_live_order(it: OrderIntent):
     await asyncio.to_thread(_live_record_success, it, order_id, fill, qty)
 
 
+# ── Stop orders at Dhan ───────────────────────────────────────────────────────
+
+def _stop_limit(security_id: str, side: str, trigger: float) -> float:
+    """Limit price for an SL-Limit order: 1 tick beyond the trigger (BUY above, SELL below)."""
+    tick = engine._tick_for(security_id, trigger)
+    if side == "BUY":
+        return engine.snap_to_tick(trigger + STOP_LIMIT_TICKS * tick, tick, "up")
+    return engine.snap_to_tick(trigger - STOP_LIMIT_TICKS * tick, tick, "down")
+
+
+async def _place_stop(it: OrderIntent, ctx: dict, token: str, qty: int, trigger: float, corr: str) -> dict:
+    """Stop order at Dhan: STOP_LOSS (SL-Limit), limit 1 tick beyond the trigger.
+    Returns the place result plus 'how' / 'order_type' / 'price'."""
+    lim = _stop_limit(it.security_id, it.side, trigger)
+    res = await _place_with_recovery(it, ctx, token, qty, order_type=ARM_ORDER_TYPE, trigger=trigger,
+                                     corr=corr, price=lim)
+    if res.get("success") and res.get("order_id"):
+        return {**res, "how": f"SL-L, limit ₹{lim:.2f}", "order_type": ARM_ORDER_TYPE, "price": lim}
+    return {"success": False, "message": res.get("message") or "order refused"}
+
+
+def _set_order_col(stock_id: str, side: str, value):
+    db = SessionLocal()
+    try:
+        s = db.query(AlgoStock).filter(AlgoStock.id == stock_id).first()
+        if s:
+            if side == "BUY":
+                s.buy_order_id = value
+            else:
+                s.sell_order_id = value
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+async def _place_protective(it: OrderIntent):
+    """Entry filled → rest a stop-loss order at Dhan on the exit side at the SL level."""
+    ctx = await asyncio.to_thread(_load_live_ctx, it.profile_id, it.stock_id)
+    if ctx.get("error") or ctx.get("live_status") != "ENTRY_OK":
+        return
+    token = ctx.get("token")
+    if not ctx.get("token_ok"):
+        token = await _refresh_live_token(it.profile_id, token)
+    if not token:
+        return
+    proxy = ctx.get("proxy") or {}
+    net = await _broker_position_qty(token, proxy, it.security_id, timeout=4.0)
+    if net == 0:
+        return                                      # already flat — nothing to protect
+    qty  = abs(net) if net else it.qty
+    side = "SELL" if it.side == "BUY" else "BUY"
+    sit  = OrderIntent(**{**it.__dict__, "kind": "STOP", "side": side, "qty": qty})
+    res  = await _place_stop(sit, ctx, token, qty, it.stop_price, _corr_id(it.stock_id, "STOP"))
+    if res.get("success"):
+        await asyncio.to_thread(_set_order_col, it.stock_id, side, str(res["order_id"]))
+        _sl_sent[it.stock_id] = it.stop_price
+        await asyncio.to_thread(_live_note, it,
+                                f"LIVE {it.symbol}: protective {side} x{qty} stop at Dhan, trigger ₹{it.stop_price:.2f} "
+                                f"[{res['how']}] ✓ order_id={res['order_id']}")
+    else:
+        await asyncio.to_thread(_live_note, it,
+                                f"⚠ LIVE {it.symbol}: protective stop NOT placed ({res.get('message')}) — "
+                                f"the engine will still exit at market when SL ₹{it.stop_price:.2f} is hit")
+
+
+async def _trail_protective(it: OrderIntent, ctx: dict, token: str, proxy: dict):
+    """Trailing SL moved → modify the protective stop's trigger at Dhan."""
+    if ctx.get("live_status") != "ENTRY_OK":
+        return
+    oid = ctx.get("buy_oid") if it.side == "BUY" else ctx.get("sell_oid")
+    if not oid:
+        return
+    st = await _order_state(token, proxy, oid)
+    if st.get("status") != "PENDING":
+        return                                      # triggered / cancelled — the EXIT handles it
+    otype = st.get("order_sub_type") or ARM_ORDER_TYPE
+    qty   = int(st.get("remaining_qty") or st.get("quantity") or it.qty)
+    old   = float(st.get("trigger_price") or 0)
+    if abs(old - it.stop_price) < 0.005:
+        return
+    price = _stop_limit(it.security_id, it.side, it.stop_price) if otype == "STOP_LOSS" else 0.0
+    await _throttle(it.profile_id)
+    try:
+        res = await asyncio.wait_for(modify_order(
+            token, ctx["client_id"], oid, otype, qty, price, trigger_price=it.stop_price, **proxy), 8)
+    except Exception as e:
+        res = {"success": False, "message": f"{type(e).__name__}: {e}"}
+    if res.get("success"):
+        await asyncio.to_thread(_live_note, it, f"LIVE {it.symbol}: stop at Dhan trailed ₹{old:.2f} → ₹{it.stop_price:.2f}")
+    else:
+        _sl_sent.pop(it.stock_id, None)              # let the next tick retry
+        await asyncio.to_thread(_live_note, it,
+                                f"⚠ LIVE {it.symbol}: could not trail stop at Dhan to ₹{it.stop_price:.2f} "
+                                f"({res.get('message')}) — the engine still exits at the trailed SL")
+
+
 # ── Resting entry orders (arm at 9:16 → fill / cancel) ────────────────────────
 
 async def _order_state(token: str, proxy: dict, order_id: str) -> dict:
@@ -513,7 +650,7 @@ async def _take_resting_fill(it: OrderIntent, token: str, proxy: dict, order_id:
     (or definitively failed); False = it never triggered → caller places a MARKET order."""
     fill = await _poll_fill(token, proxy, order_id, rounds=ARMED_FILL_WAIT)
     if fill["status"] == "EXECUTED":
-        await asyncio.to_thread(_live_record_success, it, order_id, fill, fill.get("filled") or it.qty, "SL-M (resting)")
+        await asyncio.to_thread(_live_record_success, it, order_id, fill, fill.get("filled") or it.qty, "stop (resting)")
         return True
     if fill["status"] == "REJECTED":
         await asyncio.to_thread(_live_record_failure, it,
@@ -524,7 +661,7 @@ async def _take_resting_fill(it: OrderIntent, token: str, proxy: dict, order_id:
     if c["status"] == "EXECUTED" or c["filled"]:
         await asyncio.to_thread(_live_record_success, it, order_id,
                                 {"status": "EXECUTED", "avg": c["avg"], "filled": c["filled"]},
-                                c["filled"] or it.qty, "SL-M (resting)")
+                                c["filled"] or it.qty, "stop (resting)")
         return True
     if c["status"] != "CANCELLED":
         # could not confirm the cancel → do NOT add a market order on top (double position risk)
@@ -659,13 +796,12 @@ async def _arm_one(c: dict, ltp: Optional[float]):
                          f"(LTP ₹{ltp:.2f}) — not rested, MARKET on trigger")
             continue
         it = OrderIntent(**{**it0.__dict__, "side": side})
-        res = await _place_with_recovery(it, ctx, token, c["qty"], order_type=ARM_ORDER_TYPE,
-                                         trigger=trig, corr=_corr_id(c["stock_id"], "ARM", side))
+        res = await _place_stop(it, ctx, token, c["qty"], trig, _corr_id(c["stock_id"], "ARM", side))
         token = res.get("token") or token
         if res.get("success") and res.get("order_id"):
             placed[side] = str(res["order_id"])
-            lines.append(f"[{engine._stamp()}] LIVE {c['symbol']}: {side} x{c['qty']} SL-M resting at Dhan, "
-                         f"trigger ₹{trig:.2f} ✓ order_id={res['order_id']}")
+            lines.append(f"[{engine._stamp()}] LIVE {c['symbol']}: {side} x{c['qty']} stop resting at Dhan, "
+                         f"trigger ₹{trig:.2f} [{res['how']}] ✓ order_id={res['order_id']}")
         else:
             lines.append(f"[{engine._stamp()}] LIVE {c['symbol']}: {side} resting order refused "
                          f"({res.get('message')}) — MARKET on trigger")
@@ -709,11 +845,15 @@ async def _run_live_intent(it: OrderIntent, prior: Optional[asyncio.Task]):
             except Exception:
                 pass
         await _execute_live_order(it)
+        if it.kind == "ENTRY" and it.stop_price > 0:
+            await _place_protective(it)
     except asyncio.CancelledError:
         raise
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[live] unexpected error for {it.kind} {it.symbol}: {e}\n{tb}")
+        if it.kind == "SL_UPDATE":
+            return
         try:
             await asyncio.to_thread(_live_record_failure, it, f"internal error {type(e).__name__}: {e}")
         except Exception:
