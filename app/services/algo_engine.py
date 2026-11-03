@@ -1132,7 +1132,8 @@ def _process_tick(ltp_map: dict) -> TickResult:
                     mode=LIVE if is_live else PAPER,
                     kind="ENTRY", stock_id=stock.id, run_id=stock.run_id,
                     profile_id=stock.client_profile_id, symbol=stock.symbol,
-                    security_id=sid, side=direction, qty=qty, signal_price=ltp))
+                    security_id=sid, side=direction, qty=qty, signal_price=ltp,
+                    stop_price=sl_price if is_live else 0.0))
                 book.log(stock.run_id,
                          f"{mode_label} {direction} {stock.symbol} @ ₹{ltp:.2f} "
                          f"| trigger=₹{trig:.2f} | SL=₹{sl_price:.2f} | target=₹{tgt_price:.2f} "
@@ -1148,6 +1149,14 @@ def _process_tick(ltp_map: dict) -> TickResult:
                 should_exit, reason = _check_exit(stock, ltp, strat, trail_steps)
                 if not should_exit:
                     res.open_count += 1
+                    if stock.live_status in ("ENTRY_OK", "ENTRY_PENDING"):
+                        # keep the protective stop at Dhan on the (trailed) SL — live.py acts only on a change
+                        book.intents.append(OrderIntent(
+                            mode=LIVE, kind="SL_UPDATE", stock_id=stock.id, run_id=stock.run_id,
+                            profile_id=stock.client_profile_id, symbol=stock.symbol, security_id=sid,
+                            side="SELL" if stock.entry_direction == "BUY" else "BUY",
+                            qty=int(stock.quantity or 1),
+                            stop_price=_trail_levels(stock, ltp, strat, trail_steps)["sl_price"]))
                     if _live_log_due(f"e-{stock.id}-{stock.run_id}", LIVE_LOG_ENTERED_SECS):
                         st = position_state(stock, ltp, strat, trail_steps)
                         if st:
@@ -1901,7 +1910,7 @@ def _log_mode(run: AlgoRun, profile: ClientProfile, strategy: AlgoStrategy, db: 
     if paper:
         _log(run, "Mode: PAPER — simulated trades only, no orders are sent", db)
     else:
-        _log(run, "Mode: LIVE — real MARKET orders will be sent to Dhan", db)
+        _log(run, "Mode: LIVE — real orders at Dhan: entry stops at 9:16, protective stop after fill", db)
         from app.services.execution.live import preflight_problems
         for pr in preflight_problems(profile):
             _log(run, f"LIVE pre-flight warning: {pr}", db)
