@@ -255,10 +255,11 @@ def _upsert_prev_close(prices: dict[str, float], universe: list[dict], db: Sessi
     print(f"[snapshot] prev_close saved: {len(rows)} rows → daily_price_snapshots")
 
 
-def _upsert_open_price(prices: dict[str, float], db: Session):
+def _upsert_open_price(prices: dict[str, float], db: Session, closes: Optional[dict] = None):
     """
     Bulk upsert open_price into today's snapshot rows and compute gap_pct.
-    Only updates rows that already have prev_close.
+    Only updates rows that already have prev_close. `closes` (official previous close
+    from the 9:12 FULL quote) replaces the provisional 8:45 prev_close first.
     """
     today = date.today()
     rows  = db.query(DailyPriceSnapshot).filter(
@@ -270,6 +271,8 @@ def _upsert_open_price(prices: dict[str, float], db: Session):
         open_p = prices.get(str(row.security_id))
         if not open_p or open_p <= 0:
             continue
+        if closes and (closes.get(str(row.security_id)) or 0) > 0:
+            row.prev_close = closes[str(row.security_id)]
         prev = float(row.prev_close or 0)
         row.open_price = open_p
         if prev > 0:
@@ -362,17 +365,23 @@ async def _fetch_and_save_prev_close(
 
     quotes = await angel_fetch_full_quote(jwt, api_key, master_client_id, sec_ids)
 
+    # Before the exchange rolls the day over (pre-open starts 9:00), Angel's FULL-quote `close`
+    # is still the close of the day BEFORE yesterday (3-Nov: every stock got 30-Oct's close
+    # instead of 2-Nov's) and `ltp` is yesterday's last trade. So at 8:45 the LTP is the
+    # best provisional value; the official previous close replaces it at 9:12:30
+    # (_fetch_and_save_open_price), when `close` has rolled over.
     pre_open = datetime.now(IST).hour < 9
     valid: dict[str, float] = {}
     from_close = from_ltp = 0
     for sid, q in quotes.items():
+        ltp   = q.get("ltp") or 0
         close = q.get("close") or 0
-        if close > 0:
+        if pre_open and ltp > 0:
+            valid[sid] = ltp
+            from_ltp += 1
+        elif close > 0:
             valid[sid] = close
             from_close += 1
-        elif pre_open and (q.get("ltp") or 0) > 0:
-            valid[sid] = q["ltp"]          # before 9:00 LTP is still yesterday's close
-            from_ltp += 1
 
     print(f"[algo] Prev close fetched: {len(valid)} valid / {len(sec_ids)} total "
           f"(close={from_close}, ltp-fallback={from_ltp})")
@@ -386,9 +395,35 @@ async def _fetch_and_save_prev_close(
 async def _fetch_and_save_open_price(
     jwt: str, api_key: str, master_client_id: str, universe: list[dict], db: Session
 ) -> int:
-    """Fetch LTP as opening price, update DB rows, compute gap_pct. Returns count updated."""
+    """
+    9:12:30 — one FULL quote per stock gives BOTH numbers the gap needs:
+      ltp   = today's opening (pre-open equilibrium) price
+      close = the official previous close (rolled over once pre-open started at 9:00)
+    The prev close saved at 8:45 is only provisional and is replaced here.
+    Falls back to the plain LTP fetch if the FULL quote comes back mostly empty.
+    """
     sec_ids = [u["security_id"] for u in universe]
-    print(f"[algo] Fetching opening LTP for {len(sec_ids)} stocks in {(len(sec_ids)+899)//900} batch(es)...")
+    print(f"[algo] Fetching opening price + previous close (FULL quote) for {len(sec_ids)} stocks...")
+    try:
+        quotes = await angel_fetch_full_quote(jwt, api_key, master_client_id, sec_ids)
+    except Exception as e:
+        print(f"[algo] FULL quote failed at opening scan: {type(e).__name__}: {e}")
+        quotes = {}
+    opening_q = {sid: q["ltp"] for sid, q in quotes.items() if (q.get("ltp") or 0) > 0}
+    closes_q  = {sid: q["close"] for sid, q in quotes.items() if (q.get("close") or 0) > 0}
+    if len(opening_q) >= len(sec_ids) * 0.9:
+        # sanity: the circuit band is centred on the official prev close
+        off = 0
+        for sid, c in closes_q.items():
+            uc, lc = quotes[sid].get("upper_circuit") or 0, quotes[sid].get("lower_circuit") or 0
+            if uc > 0 and lc > 0 and abs((uc + lc) / 2 - c) / c > 0.02:
+                off += 1
+        print(f"[algo] Opening prices: {len(opening_q)} | official prev close: {len(closes_q)} "
+              f"(circuit-band check: {off} differ >2%)")
+        _upsert_open_price(opening_q, db, closes=closes_q)
+        return len(opening_q)
+    print(f"[algo] FULL quote returned only {len(opening_q)}/{len(sec_ids)} — falling back to LTP; "
+          f"prev close stays the 8:45 value")
 
     opening: dict[str, float] = {}
     for i in range(0, len(sec_ids), 900):
