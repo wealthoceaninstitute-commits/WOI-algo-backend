@@ -43,6 +43,12 @@ class OrderIntent:
     signal_price: float = 0.0    # price the engine saw when it decided
     verify_position: bool = False  # EOD: check broker position first (it may already be flat)
     stop_price: float = 0.0      # live: protective stop-loss level (ENTRY: initial SL, SL_UPDATE: trailed SL)
+    target_price: float = 0.0    # live ENTRY: target level → resting LIMIT order at Dhan
+
+
+# stock_id → (reason, fill) for live positions closed at Dhan by the resting SL / target order
+# (live.py OCO watcher writes it; the engine books the exit on its next tick)
+BROKER_EXITS: dict = {}
 
 
 def dispatch(intents: list[OrderIntent]):
