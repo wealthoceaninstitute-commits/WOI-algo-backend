@@ -192,6 +192,20 @@ async def _place_with_recovery(it: OrderIntent, ctx: dict, token: str, qty: int,
 
     for attempt in range(1, LIVE_ORDER_ATTEMPTS + 1):
         await _throttle(it.profile_id)
+        _payload_log = {
+            "dhanClientId": ctx["client_id"],
+            "transactionType": it.side,
+            "exchangeSegment": "NSE_EQ",
+            "productType": "INTRADAY",
+            "orderType": order_type,
+            "securityId": str(it.security_id),
+            "symbol": it.symbol,
+            "quantity": int(qty),
+            "price": float(price or 0),
+            "triggerPrice": float(trigger or 0),
+            "correlationId": corr,
+        }
+        print(f"[live] ORDER payload attempt={attempt} {_payload_log}")
         try:
             res = await asyncio.wait_for(
                 place_order(
