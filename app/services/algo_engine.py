@@ -54,7 +54,8 @@ from app.services.angel_ws import (
     is_ws_connected, ws_stats, stop_ws_stream
 )
 from app.services.master_token import get_master_token, clear_master_token_cache
-from app.services.execution import OrderIntent, PAPER, LIVE, dispatch, wait_pending, live_in_flight, arm_entries
+from app.services.execution import (OrderIntent, PAPER, LIVE, dispatch, wait_pending, live_in_flight, arm_entries,
+                                    BROKER_EXITS)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -1143,7 +1144,8 @@ class _Book:
         row.trade_count = (row.trade_count or 0) + 1
 
     def exit(self, stock: AlgoStock, strat, reason: str, fill: float, ltp: float,
-             verify_position: bool = False, when: Optional[datetime] = None, note: str = ""):
+             verify_position: bool = False, when: Optional[datetime] = None, note: str = "",
+             broker_closed: bool = False):
         """Close one position (shared bookkeeping) and queue the exit on the route its ENTRY took."""
         pnl   = _calc_pnl(stock, fill)
         entry = float(stock.entry_price)
@@ -1171,7 +1173,7 @@ class _Book:
             side="SELL" if stock.entry_direction == "BUY" else "BUY",
             qty=int(stock.quantity or 1), reason=reason, signal_price=ltp,
             verify_position=True))
-        if not live_pos and not strat.paper:
+        if not live_pos and not strat.paper and not broker_closed:
             self.log(stock.run_id,
                      f"LIVE client: {stock.symbol} has no broker position for this trade — exit recorded in the algo only, no order sent")
 
@@ -1298,7 +1300,8 @@ def _process_tick(ltp_map: dict) -> TickResult:
                     kind="ENTRY", stock_id=stock.id, run_id=stock.run_id,
                     profile_id=stock.client_profile_id, symbol=stock.symbol,
                     security_id=sid, side=direction, qty=qty, signal_price=ltp,
-                    stop_price=sl_price if is_live else 0.0))
+                    stop_price=sl_price if is_live else 0.0,
+                    target_price=tgt_price if is_live else 0.0))
                 book.log(stock.run_id,
                          f"{mode_label} {direction} {stock.symbol} @ ₹{ltp:.2f} "
                          f"| trigger=₹{trig:.2f} | SL=₹{sl_price:.2f} | target=₹{tgt_price:.2f} "
@@ -1307,6 +1310,15 @@ def _process_tick(ltp_map: dict) -> TickResult:
                 continue
 
             # ── ENTERED: ratchet peak, check SL / target ──────────────────────
+            if stock.entry_price and stock.entry_direction and stock.live_status == "EXIT_OK":
+                # the resting SL / target order at Dhan closed it (OCO watcher) — book it, send nothing
+                info   = BROKER_EXITS.pop(stock.id, None)
+                reason = info[0] if info else "BROKER"
+                fill   = float(stock.live_exit_price or 0) or (info[1] if info and info[1] else ltp)
+                book.exit(stock, strat, reason, fill, ltp, note=" | closed by resting order at Dhan",
+                          broker_closed=True)
+                continue
+
             if stock.entry_price and stock.entry_direction:
                 new_peak = _favourable_peak(stock, ltp)
                 if stock.peak_price is None or float(stock.peak_price) != new_peak:
