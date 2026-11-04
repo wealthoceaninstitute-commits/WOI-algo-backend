@@ -36,11 +36,12 @@ from app.core.encryption import decrypt
 from app.models.trading import ClientProfile, AlgoRun, AlgoStock, AlgoStrategy, DailyPnl
 from app.services.dhan_trade import (
     place_order, cancel_order, modify_order, get_order_by_id, get_positions, find_order_by_correlation, normalize_order,
+    get_order_book, _map_status,
 )
 from app.services.token_manager import (
     token_is_valid, get_stored_token, refresh_token, _get_proxy_kwargs,
 )
-from app.services.execution import OrderIntent
+from app.services.execution import OrderIntent, BROKER_EXITS
 from app.services import algo_engine as engine     # shared run-log helpers (resolved at call time)
 
 
@@ -66,7 +67,20 @@ STOP_LIMIT_TICKS     = 1                    # SL-Limit price = trigger ± 1 tick
 ARMED_FILL_WAIT      = 12                   # polls (~0.5 s each) for a triggered resting order to show TRADED
 ORDER_SPACING        = 0.12                 # seconds between order calls per client (Dhan: 10/s)
 
+OCO_POLL_SECS        = 1.5                  # how often the OCO watcher reads the order book per open position
+TARGET_FILL_WAIT     = 6                    # polls (~0.5 s) for the resting target to show TRADED on a TARGET exit
+
 _sl_sent:    dict[str, float] = {}   # stock_id → last protective-SL trigger sent (dedupes SL_UPDATE)
+_tgt_oid:    dict[str, str]   = {}   # stock_id → resting target LIMIT order id at Dhan
+_tgt_none:   set              = set()  # stock_ids whose target order was never placed (skip the lookup)
+_oco_tasks:  dict[str, asyncio.Task] = {}
+_oco_seen:   set              = set()  # stock_ids that already had a watcher in this process
+_stock_locks: dict[str, asyncio.Lock] = {}
+
+
+def _stock_lock(stock_id: str) -> asyncio.Lock:
+    """Serialises the engine's EXIT and the OCO watcher for one stock (never both act at once)."""
+    return _stock_locks.setdefault(stock_id, asyncio.Lock())
 _rate_last:  dict[str, float] = {}
 _rate_locks: dict[str, asyncio.Lock] = {}
 
@@ -87,6 +101,8 @@ def _corr_id(stock_id: str, kind: str, side: str = "") -> str:
         return base[:22] + "A" + (side[:1] or "X")
     if kind == "STOP":
         return base[:22] + "PS"
+    if kind == "TGT":
+        return base[:22] + "PT"
     return base[:23] + ("E" if kind == "ENTRY" else "X")
 
 
@@ -94,6 +110,9 @@ def submit(it: OrderIntent):
     """Fire-and-forget: the order runs in its own task (an entry always completes before its exit;
     an entry / cancel always waits for that stock's arming to finish)."""
     if it.kind == "SL_UPDATE":
+        # self-heal: an open live position must always have its OCO watcher (e.g. after a restart)
+        if it.stock_id not in _oco_seen and it.stock_id not in _entry_tasks:
+            _start_oco(it.stock_id, it.run_id, it.profile_id, it.symbol, it.security_id, it.side, it.qty)
         last = _sl_sent.get(it.stock_id)
         if not it.stop_price or (last is not None and abs(last - it.stop_price) < 0.005):
             return                                   # unchanged — sent every tick, acted on only when it moves
@@ -402,6 +421,10 @@ async def _execute_live_order(it: OrderIntent):
     # An exit only makes sense if the matching entry really went through at the broker.
     # (Positions that were opened as paper-only — e.g. before a client was switched to
     # live — must never send a real order: a SELL with no position opens a fresh SHORT.)
+    if it.kind == "EXIT" and ctx.get("live_status") == "EXIT_OK":
+        await asyncio.to_thread(_live_note, it, f"LIVE EXIT {it.symbol} [{it.reason}] — already closed at Dhan "
+                                                f"by its resting SL / target order; nothing to send")
+        return
     if it.kind == "EXIT" and ctx.get("live_status") not in ("ENTRY_OK", "ENTRY_PENDING"):
         await asyncio.to_thread(
             _live_note, it,
@@ -445,9 +468,37 @@ async def _execute_live_order(it: OrderIntent):
         return
 
     if it.kind == "EXIT":
+        prot = ctx.get("buy_oid") if it.side == "BUY" else ctx.get("sell_oid")
+
+        # Resting target LIMIT at Dhan. TARGET exit → its fill IS the exit; any other exit
+        # (SL / EOD / recovery) → cancel it first so it can never open a fresh position later.
+        tgt = await _target_order(it, token, proxy)
+        if tgt:
+            if it.reason == "TARGET":
+                f = await _poll_fill(token, proxy, tgt, rounds=TARGET_FILL_WAIT)
+                if f["status"] != "EXECUTED":
+                    c = await _cancel_resting(it.profile_id, token, proxy, tgt)
+                    f = {"status": "EXECUTED" if c["status"] == "EXECUTED" else "PARTIAL",
+                         "avg": c["avg"], "filled": c["filled"]}
+            else:
+                c = await _cancel_resting(it.profile_id, token, proxy, tgt)
+                f = {"status": "EXECUTED" if c["status"] == "EXECUTED" else "PARTIAL",
+                     "avg": c["avg"], "filled": c["filled"]}
+                if c["status"] == "CANCELLED" and not c["filled"]:
+                    await asyncio.to_thread(_live_note, it, f"LIVE {it.symbol}: target order {tgt} cancelled ({it.reason})")
+            _tgt_oid.pop(it.stock_id, None)
+            if f["status"] == "EXECUTED" and (f.get("filled") or 0) >= it.qty:
+                # the target order closed the whole position → drop the protective stop
+                if prot:
+                    await _cancel_other_leg(it, ctx, token, proxy, prot, "protective SL")
+                    _sl_sent.pop(it.stock_id, None)
+                await asyncio.to_thread(_live_record_success, it, tgt, f, f.get("filled") or it.qty,
+                                        "target (LIMIT resting at Dhan)")
+                return
+            # not (fully) filled → carry on: SL handling / market close of whatever is still open
+
         # The protective stop at Dhan sits on the exit side. SL exit → its fill IS the exit;
         # any other exit (target / EOD / recovery) → cancel it first, then close at market.
-        prot = ctx.get("buy_oid") if it.side == "BUY" else ctx.get("sell_oid")
         if prot:
             if it.reason == "SL":
                 f = await _poll_fill(token, proxy, prot, rounds=ARMED_FILL_WAIT)
@@ -564,34 +615,191 @@ def _set_order_col(stock_id: str, side: str, value):
         db.close()
 
 
+def _note_and_print(it: OrderIntent, msg: str):
+    print(f"[live] {msg}")
+    _live_note(it, msg)
+
+
 async def _place_protective(it: OrderIntent):
-    """Entry filled → rest a stop-loss order at Dhan on the exit side at the SL level."""
+    """Entry filled → rest the exit legs at Dhan on the exit side:
+         • protective STOP_LOSS at the SL level (trailing modifies it)
+         • target LIMIT at the target level
+       then start the OCO watcher: whichever leg fills, the other is cancelled at once."""
     ctx = await asyncio.to_thread(_load_live_ctx, it.profile_id, it.stock_id)
     if ctx.get("error") or ctx.get("live_status") != "ENTRY_OK":
+        await asyncio.to_thread(_note_and_print, it,
+                                f"LIVE {it.symbol}: exit orders not placed — "
+                                f"{ctx.get('error') or 'entry status ' + str(ctx.get('live_status'))}")
         return
     token = ctx.get("token")
     if not ctx.get("token_ok"):
         token = await _refresh_live_token(it.profile_id, token)
     if not token:
+        await asyncio.to_thread(_note_and_print, it,
+                                f"⚠ LIVE {it.symbol}: exit orders NOT placed (no valid Dhan token) — "
+                                f"the engine will exit at market on SL / target")
         return
     proxy = ctx.get("proxy") or {}
-    net = await _broker_position_qty(token, proxy, it.security_id, timeout=4.0)
-    if net == 0:
-        return                                      # already flat — nothing to protect
+    # The entry fill is already confirmed. Dhan's positions can lag the fill by a moment, so a
+    # 0 right after the fill is not "flat" — re-check a few times, then protect the entry qty.
+    net = None
+    for i in range(3):
+        net = await _broker_position_qty(token, proxy, it.security_id, timeout=4.0)
+        if net:
+            break
+        await asyncio.sleep(0.5)
     qty  = abs(net) if net else it.qty
     side = "SELL" if it.side == "BUY" else "BUY"
+
+    # 1) protective stop
     sit  = OrderIntent(**{**it.__dict__, "kind": "STOP", "side": side, "qty": qty})
     res  = await _place_stop(sit, ctx, token, qty, it.stop_price, _corr_id(it.stock_id, "STOP"))
     if res.get("success"):
         await asyncio.to_thread(_set_order_col, it.stock_id, side, str(res["order_id"]))
         _sl_sent[it.stock_id] = it.stop_price
-        await asyncio.to_thread(_live_note, it,
+        await asyncio.to_thread(_note_and_print, it,
                                 f"LIVE {it.symbol}: protective {side} x{qty} stop at Dhan, trigger ₹{it.stop_price:.2f} "
                                 f"[{res['how']}] ✓ order_id={res['order_id']}")
     else:
-        await asyncio.to_thread(_live_note, it,
+        await asyncio.to_thread(_note_and_print, it,
                                 f"⚠ LIVE {it.symbol}: protective stop NOT placed ({res.get('message')}) — "
                                 f"the engine will still exit at market when SL ₹{it.stop_price:.2f} is hit")
+
+    # 2) target
+    placed_tgt = False
+    if it.target_price > 0:
+        tit = OrderIntent(**{**it.__dict__, "kind": "TGT", "side": side, "qty": qty})
+        tr  = await _place_with_recovery(tit, ctx, token, qty, order_type="LIMIT",
+                                         price=float(it.target_price), corr=_corr_id(it.stock_id, "TGT"))
+        if tr.get("success") and tr.get("order_id"):
+            placed_tgt = True
+            _tgt_oid[it.stock_id] = str(tr["order_id"])
+            await asyncio.to_thread(_note_and_print, it,
+                                    f"LIVE {it.symbol}: target {side} x{qty} LIMIT at Dhan ₹{it.target_price:.2f} "
+                                    f"✓ order_id={tr['order_id']}")
+        else:
+            await asyncio.to_thread(_note_and_print, it,
+                                    f"⚠ LIVE {it.symbol}: target order NOT placed ({tr.get('message')}) — "
+                                    f"the engine will exit at market when target ₹{it.target_price:.2f} is hit")
+    if not placed_tgt:
+        _tgt_none.add(it.stock_id)
+
+    if res.get("success") or placed_tgt:
+        _start_oco(it.stock_id, it.run_id, it.profile_id, it.symbol, it.security_id, side, qty)
+
+
+async def _target_order(it: OrderIntent, token: str, proxy: dict) -> Optional[str]:
+    """Id of this stock's resting target order (memory first; after a restart, via correlationId)."""
+    oid = _tgt_oid.get(it.stock_id)
+    if oid or it.stock_id in _tgt_none:
+        return oid
+    try:
+        o = await asyncio.wait_for(find_order_by_correlation(token, _corr_id(it.stock_id, "TGT"), **proxy), 4)
+    except Exception:
+        return None
+    if o and _map_status(o.get("orderStatus", "")) in ("PENDING", "EXECUTED"):
+        return str(o.get("orderId"))
+    return None
+
+
+async def _cancel_other_leg(it: OrderIntent, ctx: dict, token: str, proxy: dict, oid: str, label: str):
+    """One exit leg filled → cancel the other. If it ALSO filled (price swung through both),
+    the position has flipped — square the extra off at market straight away."""
+    c = await _cancel_resting(it.profile_id, token, proxy, oid)
+    if c["filled"]:
+        back = "BUY" if it.side == "SELL" else "SELL"
+        flat = OrderIntent(**{**it.__dict__, "kind": "EXIT", "side": back, "qty": c["filled"],
+                              "reason": "OCO_DOUBLE_FILL"})
+        r = await _place_with_recovery(flat, ctx, token, c["filled"])
+        msg = (f"✓ squared off at market (order {r.get('order_id')})" if r.get("success")
+               else f"⚠ SQUARE-OFF FAILED: {r.get('message')} — CLOSE IT IN THE DHAN APP")
+        await asyncio.to_thread(_note_and_print, it,
+                                f"⚠ LIVE {it.symbol}: {label} {oid} ALSO filled x{c['filled']} @ ₹{c['avg']:.2f} — {msg}")
+    elif c["status"] == "CANCELLED":
+        await asyncio.to_thread(_live_note, it, f"LIVE {it.symbol}: {label} {oid} cancelled (other leg filled)")
+    else:
+        await asyncio.to_thread(_note_and_print, it,
+                                f"⚠ LIVE {it.symbol}: could not confirm cancel of {label} {oid} "
+                                f"(state {c['status']}) — CHECK THE DHAN APP")
+
+
+def _start_oco(stock_id: str, run_id: str, profile_id: str, symbol: str, security_id: str,
+               exit_side: str, qty: int):
+    if stock_id in _oco_tasks:
+        return
+    _oco_seen.add(stock_id)
+    base = OrderIntent(mode="live", kind="EXIT", stock_id=stock_id, run_id=run_id, profile_id=profile_id,
+                       symbol=symbol, security_id=str(security_id), side=exit_side, qty=int(qty or 1))
+    t = asyncio.create_task(_oco_watch(base))
+    _oco_tasks[stock_id] = t
+    t.add_done_callback(lambda _t, sid=stock_id: _oco_tasks.pop(sid, None))
+
+
+async def _oco_watch(base: OrderIntent):
+    """Watches the two resting exit legs (SL stop + target LIMIT) of one live position.
+    The exchange can fill either between engine ticks (a wick); when one fills the other is
+    cancelled immediately and the engine is told to book the exit — so a leftover leg can never
+    open a fresh position. Ends as soon as the position is no longer ENTRY_OK."""
+    tcorr = _corr_id(base.stock_id, "TGT")
+    try:
+        while True:
+            await asyncio.sleep(OCO_POLL_SECS)
+            ctx = await asyncio.to_thread(_load_live_ctx, base.profile_id, base.stock_id)
+            if ctx.get("error") or ctx.get("live_status") != "ENTRY_OK":
+                return
+            token = ctx.get("token")
+            if not token:
+                continue
+            proxy = ctx.get("proxy") or {}
+            try:
+                book = await asyncio.wait_for(get_order_book(token, **proxy), 6)
+            except Exception:
+                continue
+            orders = book.get("data") if book.get("success") else None
+            if not isinstance(orders, list):
+                continue
+            prot = ctx.get("buy_oid") if base.side == "BUY" else ctx.get("sell_oid")
+            tgt  = _tgt_oid.get(base.stock_id)
+            by_id = {}
+            for o in orders:
+                oid = str(o.get("orderId"))
+                by_id[oid] = o
+                if not tgt and base.stock_id not in _tgt_none and str(o.get("correlationId") or "") == tcorr \
+                        and _map_status(o.get("orderStatus", "")) in ("PENDING", "EXECUTED"):
+                    tgt = oid
+                    _tgt_oid[base.stock_id] = oid
+            if not prot and not tgt:
+                return                                       # nothing resting — engine exits at market
+            hit = None
+            for name, oid, other, label in (("SL", prot, tgt, "target order"),
+                                            ("TARGET", tgt, prot, "protective SL")):
+                o = by_id.get(str(oid)) if oid else None
+                if o and _map_status(o.get("orderStatus", "")) == "EXECUTED":
+                    hit = (name, str(oid), normalize_order(o), other, label)
+                    break
+            if not hit:
+                continue
+            async with _stock_lock(base.stock_id):
+                ctx2 = await asyncio.to_thread(_load_live_ctx, base.profile_id, base.stock_id)
+                if ctx2.get("live_status") != "ENTRY_OK":
+                    return                                   # the engine's EXIT already handled it
+                name, oid, o, other, label = hit
+                qty = int(o.get("filled_qty") or base.qty)
+                avg = float(o.get("executed_price") or 0)
+                xit = OrderIntent(**{**base.__dict__, "qty": qty, "reason": name})
+                if other:
+                    await _cancel_other_leg(xit, ctx2, token, proxy, other, label)
+                _tgt_oid.pop(base.stock_id, None)
+                _sl_sent.pop(base.stock_id, None)
+                BROKER_EXITS[base.stock_id] = (name, avg)
+                await asyncio.to_thread(_live_record_success, xit, oid,
+                                        {"status": "EXECUTED", "avg": avg, "filled": qty}, qty,
+                                        f"{name} (resting at Dhan)")
+            return
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[live] OCO watcher {base.symbol} error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
 async def _trail_protective(it: OrderIntent, ctx: dict, token: str, proxy: dict):
@@ -858,7 +1066,11 @@ async def _run_live_intent(it: OrderIntent, prior: Optional[asyncio.Task]):
                 await asyncio.wait_for(asyncio.shield(prior), 20)
             except Exception:
                 pass
-        await _execute_live_order(it)
+        if it.kind == "EXIT":
+            async with _stock_lock(it.stock_id):       # never at the same time as the OCO watcher
+                await _execute_live_order(it)
+        else:
+            await _execute_live_order(it)
         if it.kind == "ENTRY" and it.stop_price > 0:
             await _place_protective(it)
     except asyncio.CancelledError:
