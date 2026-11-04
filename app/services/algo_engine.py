@@ -484,7 +484,8 @@ def _apply_filters(gap_results: dict, strategy: AlgoStrategy, run: AlgoRun, db: 
     _log(run, f"Rejected by gap filter: {len(rej_gap)} stocks", db)
     _log(run, f"Rejected by price filter: {len(rej_price)} stocks", db)
     if excl_be:
-        _log(run, f"Rejected BE series: {len(rej_be)} stocks", db)
+        be_names = ", ".join(rej_be) if rej_be else "none"
+        _log(run, f"Rejected BE series: {len(rej_be)} stocks — {be_names}", db)
     _log(run, f"Passed all filters: {len(passed)} stocks qualify", db)
 
     if not passed:
