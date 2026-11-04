@@ -30,7 +30,7 @@ Benefits:
   - Debug endpoint: GET /api/algo/debug/snapshot?date=YYYY-MM-DD
 """
 
-import asyncio, json, math, time, traceback
+import asyncio, json, math, threading, time, traceback
 from dataclasses import dataclass, field
 from datetime import datetime, date, timezone, timedelta
 from types import SimpleNamespace
@@ -498,6 +498,7 @@ def _apply_filters(gap_results: dict, strategy: AlgoStrategy, run: AlgoRun, db: 
 
     passed.sort(key=lambda x: abs(x["gap_pct"]), reverse=True)
     selected = passed[:max_n]
+    standby  = passed[max_n:max_n + STANDBY_STOCKS]
 
     _log(run, f"Selected top {len(selected)} of {len(passed)} qualifying stocks:", db)
     for s in selected:
@@ -505,8 +506,12 @@ def _apply_filters(gap_results: dict, strategy: AlgoStrategy, run: AlgoRun, db: 
             f"  {s['symbol']}: gap={s['gap_pct']:+.2f}% | "
             f"prev=₹{s['prev_close']} | open=₹{s['open_price']} | series={s['series']}",
             db)
+    if standby:
+        _log(run, "Standby (replaces a stock whose target is blocked by its circuit): " +
+             ", ".join(f"{s['symbol']}({s['gap_pct']:+.2f}%)" for s in standby), db)
 
-    return selected
+    # caller takes the first max_n as the day's stocks, the rest stay on standby
+    return selected + standby
 
 
 
@@ -542,6 +547,140 @@ def _entry_levels(candle: dict, strategy, security_id: str) -> dict:
     }
 
 
+# ── Standby stocks / target-room check ────────────────────────────────────────
+# A stock is only worth entering if its target fits inside today's circuit band:
+#   BUY  target = buy_trigger  × (1 + target_r × sl_pct) must be ≤ upper circuit
+#   SELL target = sell_trigger × (1 − target_r × sl_pct) must be ≥ lower circuit
+# If either side is blocked at 9:16 the stock is cancelled (CIRCUIT_ROOM) and the next-best
+# gap stock (standby, picked at 9:12) is entered instead. Standbys live in memory only —
+# nothing is written to the DB / shown in the UI unless one is actually entered.
+
+STANDBY_STOCKS = 2                                   # extra stocks kept ready per client
+
+_circuits: dict[str, tuple[float, float]] = {}       # security_id → (upper, lower) from the 9:12 quote
+_standby: dict[str, list[dict]] = {}                 # run_id → standby items, best gap first
+_standby_need: dict[str, list[str]] = {}             # run_id → symbols still waiting for a replacement
+_standby_candles: dict[str, Optional[dict]] = {}     # security_id → first candle (None = fetch failed)
+_standby_lock = threading.Lock()
+
+
+def _reset_standby():
+    with _standby_lock:
+        _circuits.clear(); _standby.clear(); _standby_need.clear(); _standby_candles.clear()
+
+
+def _target_room(e: dict, strategy, sid: str) -> str:
+    """'' if the target fits inside the circuit band on both sides, else the reason."""
+    uc, lc = _circuits.get(str(sid), (0, 0))
+    move = float(strategy.target_r or 0) * float(strategy.sl_pct or 0)
+    if move <= 0:
+        return ""
+    why = []
+    if uc and uc > 0:
+        t = e["buy_trigger"] * (1 + move)
+        if t > uc:
+            why.append(f"BUY ₹{e['buy_trigger']:.2f} → target ₹{t:.2f} above UC ₹{uc}")
+    if lc and lc > 0:
+        t = e["sell_trigger"] * (1 - move)
+        if t < lc:
+            why.append(f"SELL ₹{e['sell_trigger']:.2f} → target ₹{t:.2f} below LC ₹{lc}")
+    return "; ".join(why)
+
+
+def _fill_standby_sync() -> list[str]:
+    """Enter standby stocks for every run still owed a replacement. Returns new AlgoStock ids."""
+    new_ids: list[str] = []
+    with _standby_lock:
+        owed = [rid for rid, syms in _standby_need.items() if syms]
+        if not owed:
+            return new_ids
+        db = SessionLocal()
+        try:
+            for rid in owed:
+                lines: list[str] = []
+                queue = _standby.get(rid, [])
+                while _standby_need[rid] and queue:
+                    c   = queue[0]
+                    sid = str(c["security_id"])
+                    if sid not in _standby_candles:
+                        break                         # its candle is still on the way — it will call us
+                    queue.pop(0)
+                    candle = _standby_candles[sid]
+                    if db.query(AlgoStock.id).filter(AlgoStock.run_id == rid,
+                                                     AlgoStock.security_id == sid).first():
+                        continue
+                    if not candle:
+                        lines.append(f"[{_stamp()}] Standby {c['symbol']}: no first candle — skipped")
+                        continue
+                    strat = db.query(AlgoStrategy).filter(
+                        AlgoStrategy.client_profile_id == c["profile_id"]).first()
+                    if not strat:
+                        continue
+                    e = _entry_levels(candle, strat, sid)
+                    why = _target_room(e, strat, sid)
+                    if why:
+                        lines.append(f"[{_stamp()}] Standby {c['symbol']}: skipped — {why}")
+                        continue
+                    replaced = _standby_need[rid].pop(0)
+                    row = AlgoStock(
+                        run_id=rid,
+                        client_profile_id=c["profile_id"],
+                        symbol=c["symbol"],
+                        security_id=sid,
+                        gap_pct=c["gap_pct"],
+                        direction="UP" if c["gap_pct"] > 0 else "DOWN",
+                        prev_close=c["prev_close"],
+                        status="watching",
+                        source="standby",
+                        candle_high=e["candle_high"],
+                        candle_low=e["candle_low"],
+                        candle_close=e["candle_close"],
+                        buy_trigger=e["buy_trigger"],
+                        sell_trigger=e["sell_trigger"],
+                        quantity=e["quantity"],
+                    )
+                    db.add(row)
+                    db.flush()
+                    new_ids.append(row.id)
+                    lines.append(
+                        f"[{_stamp()}] REPLACEMENT: {c['symbol']} enters in place of {replaced} | "
+                        f"O=₹{e['candle_open']:.2f} H=₹{e['candle_high']:.2f} L=₹{e['candle_low']:.2f} "
+                        f"C=₹{e['candle_close']:.2f} | BUY=₹{e['buy_trigger']:.2f} | "
+                        f"SELL=₹{e['sell_trigger']:.2f} | Qty={e['quantity']}")
+                if _standby_need[rid] and not queue:
+                    lines.append(f"[{_stamp()}] No standby left to replace {', '.join(_standby_need[rid])}")
+                    _standby_need[rid] = []
+                db.commit()
+                if lines:
+                    _append_run_log(db, rid, lines)
+                    db.commit()
+        except Exception as ex:
+            print(f"[algo] standby fill failed: {type(ex).__name__}: {ex}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        finally:
+            db.close()
+    return new_ids
+
+
+async def _standby_candle_worker(sid: str, jwt: str, api_key: str, client_id: str):
+    """First candle for a standby-only security (not traded by anyone yet)."""
+    candle = None
+    try:
+        candle = await angel_fetch_first_candle(jwt, api_key, client_id, sid)
+    except Exception as e:
+        print(f"[algo] standby candle {sid} failed: {type(e).__name__}: {e}")
+    _standby_candles[str(sid)] = candle
+    try:
+        new_ids = await asyncio.to_thread(_fill_standby_sync)
+        if new_ids:
+            arm_entries(new_ids)
+    except Exception as e:
+        print(f"[algo] standby fill ({sid}) failed: {type(e).__name__}: {e}")
+
+
 def _apply_candle_sync(sid: str, candle: Optional[dict], stock_ids: list[str]) -> int:
     """
     Write the candle-derived levels to every client's row for this security (worker thread).
@@ -554,6 +693,7 @@ def _apply_candle_sync(sid: str, candle: Optional[dict], stock_ids: list[str]) -
     """
     db = SessionLocal()
     logs: dict[str, list[str]] = {}
+    need: list[tuple[str, str]] = []          # (run_id, symbol) cancelled for CIRCUIT_ROOM
     failed = 0
     try:
         stocks = (db.query(AlgoStock).filter(AlgoStock.id.in_(stock_ids))
@@ -567,6 +707,19 @@ def _apply_candle_sync(sid: str, candle: Optional[dict], stock_ids: list[str]) -
             strat = strat_by_pf.get(stock.client_profile_id)
             if candle and strat:
                 e = _entry_levels(candle, strat, sid)
+                why = _target_room(e, strat, sid)
+                if why:
+                    # target can't be reached inside the circuit band → skip, standby takes its place
+                    stock.candle_high  = e["candle_high"]
+                    stock.candle_low   = e["candle_low"]
+                    stock.candle_close = e["candle_close"]
+                    stock.status       = "cancelled"
+                    stock.exit_reason  = "CIRCUIT_ROOM"
+                    logs.setdefault(stock.run_id, []).append(
+                        f"[{_stamp()}] {stock.symbol}: SKIPPED — target outside circuit ({why}) "
+                        f"— entering standby stock instead")
+                    need.append((stock.run_id, stock.symbol))
+                    continue
                 stock.candle_high  = e["candle_high"]
                 stock.candle_low   = e["candle_low"]
                 stock.candle_close = e["candle_close"]
@@ -585,6 +738,10 @@ def _apply_candle_sync(sid: str, candle: Optional[dict], stock_ids: list[str]) -
             else:
                 failed += 1       # no strategy row for this client — nothing to apply
         db.commit()
+        if need:
+            with _standby_lock:
+                for rid, sym in need:
+                    _standby_need.setdefault(rid, []).append(sym)
     except Exception as e:
         print(f"[algo] apply_candle {sid} failed: {type(e).__name__}: {e}")
         try:
@@ -628,6 +785,7 @@ async def _candle_worker(sid: str, stock_ids: list[str], jwt: str, api_key: str,
         candle = await angel_fetch_first_candle(jwt, api_key, client_id, sid)
     except Exception as e:
         print(f"[algo] first candle {sid} failed: {type(e).__name__}: {e}")
+    _standby_candles[str(sid)] = candle          # a standby elsewhere may be this same security
 
     # Apply, verify, retry — a stock must never be left silently "waiting" without trigger levels.
     for attempt in range(1, 5):
@@ -636,6 +794,12 @@ async def _candle_worker(sid: str, stock_ids: list[str], jwt: str, api_key: str,
             if await asyncio.to_thread(_levels_missing_sync, stock_ids) == 0:
                 if candle:
                     arm_entries(stock_ids)      # LIVE clients: rest entry stop orders at Dhan now (paper: no-op)
+                try:
+                    new_ids = await asyncio.to_thread(_fill_standby_sync)   # replace CIRCUIT_ROOM skips
+                    if new_ids:
+                        arm_entries(new_ids)
+                except Exception as e:
+                    print(f"[algo] standby fill ({sid}) failed: {type(e).__name__}: {e}")
                 return
         except Exception as e:
             print(f"[algo] apply candle {sid} attempt {attempt} failed: {type(e).__name__}: {e}")
@@ -2065,8 +2229,9 @@ async def run_daily_algo():
             client_sids = {u["security_id"] for u in client_universes[profile.id]}
             client_gaps = {sid: d for sid, d in all_gaps.items() if sid in client_sids}
             run.stocks_scanned = len(client_sids)
-            selected = _apply_filters(client_gaps, strat, run, db)
-            run.stocks_selected = len(selected)
+            selected = _apply_filters(client_gaps, strat, run, db)   # top max_n + standby
+            max_n = int(strat.max_stocks_per_day)
+            run.stocks_selected = min(max_n, len(selected))
             db.commit()
 
             if not selected:
@@ -2098,12 +2263,22 @@ async def run_daily_algo():
                         else:
                             item["upper_circuit"] = upper
                             item["lower_circuit"] = lower
+                            _circuits[str(sid)] = (float(upper or 0), float(lower or 0))
                             circuit_passed.append(item)
                             _log(run, f"  OK {item['symbol']}: LTP=₹{ltp} UC=₹{upper} LC=₹{lower}", db)
                     _log(run, f"Circuit filter: {len(circuit_passed)}/{len(selected)} stocks passed", db)
                     selected = circuit_passed
                 except Exception as e:
                     _log(run, f"Circuit limit check failed: {e} — proceeding without filter", db)
+
+                # first max_n trade; the rest wait as standby (also back-fills circuit removals above)
+                standby  = selected[max_n:]
+                selected = selected[:max_n]
+                with _standby_lock:
+                    _standby[run.id] = [{**s, "profile_id": profile.id} for s in standby]
+                if standby:
+                    _log(run, f"Trading {len(selected)} stocks: {', '.join(s['symbol'] for s in selected)} | "
+                              f"standby: {', '.join(s['symbol'] for s in standby)}", db)
 
                 for item in selected:
                     exists = db.query(AlgoStock).filter(
@@ -2124,6 +2299,7 @@ async def run_daily_algo():
                         ))
                 db.commit()
 
+        _reset_standby()
         pending = list(clients)
         for _attempt in (1, 2):
             failed = []
@@ -2172,6 +2348,14 @@ async def run_daily_algo():
             asyncio.create_task(_candle_worker(sid, ids, jwt, api_key, master_client_id))
             for sid, ids in all_watching.items()
         ]
+        # standby-only securities: fetch their candle too, so a replacement is ready at once
+        with _standby_lock:
+            standby_sids = {str(c["security_id"]) for lst in _standby.values() for c in lst}
+        for sid in sorted(standby_sids - {str(s) for s in all_watching}):
+            candle_tasks.append(asyncio.create_task(
+                _standby_candle_worker(sid, jwt, api_key, master_client_id)))
+        if standby_sids:
+            print(f"[algo] Standby candles: {len(standby_sids)} securities ready for CIRCUIT_ROOM replacement")
 
         run_ids = [runs[p.id][0].id for p, _ in clients]
         # (the monitor works on its own short-lived sessions — this one stays idle until the end)
