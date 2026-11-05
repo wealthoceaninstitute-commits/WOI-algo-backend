@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     MASTER_EMAIL: str = ""
     MASTER_PASSWORD: str = ""
     MASTER_NAME: str = "Master Admin"
+    # Login email of the LIVE client whose real Dhan trades every PAPER client mirrors
+    # (entry / exit at that account's actual fill prices). Empty = paper simulates on its own.
+    COPY_MASTER_EMAIL: str = ""
 
     class Config:
         env_file = ".env"
