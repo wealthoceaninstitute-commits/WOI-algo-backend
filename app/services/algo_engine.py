@@ -41,6 +41,8 @@ from sqlalchemy import text, update, func, case
 
 from app.core.database import EngineSessionLocal as SessionLocal   # engine has its OWN pool (API traffic can't starve it)
 from app.core.encryption import decrypt
+from app.core.config import get_settings
+from app.models.user import User
 from app.models.trading import (
     ClientProfile, AlgoStrategy, AlgoRun, AlgoStock,
     DailyPnl, DailyPriceSnapshot, DhanCredential,
@@ -1102,6 +1104,129 @@ def _load_ctx(db: Session, profile_ids: set) -> dict:
     return m
 
 
+# ── Copy-master mirroring ─────────────────────────────────────────────────────
+# One LIVE client (COPY_MASTER_EMAIL) is the master copy account. Every PAPER client's stock
+# that the master also has today follows the master's REAL Dhan trade instead of simulating:
+#   • enters only when the master's entry filled at Dhan, at the master's fill price, same side
+#   • is skipped when the master's entry was cancelled / failed / never triggered
+#   • exits when the master exits, at the master's Dhan exit fill, with the master's reason
+# Each paper client keeps its own quantity (risk). Live clients are never mirrored. If the
+# master is not set, not live, or has no row for that stock, paper simulates exactly as before.
+
+MIRROR_EXIT_WAIT_SECS = 15          # wait this long for the master's Dhan exit fill, then use its signal price
+_mirror_cache = {"ts": 0.0, "pid": None}
+
+
+def _mirror_pid(db: Session) -> Optional[str]:
+    now = time.monotonic()
+    if now - _mirror_cache["ts"] < 60:
+        return _mirror_cache["pid"]
+    pid = None
+    email = (get_settings().COPY_MASTER_EMAIL or "").strip().lower()
+    if email:
+        prof = (db.query(ClientProfile).join(User, User.id == ClientProfile.user_id)
+                .filter(func.lower(User.email) == email).first())
+        if prof is None:
+            print(f"[algo] COPY_MASTER_EMAIL={email}: no client with that email — paper simulates on its own")
+        else:
+            strat = db.query(AlgoStrategy).filter(AlgoStrategy.client_profile_id == prof.id).first()
+            if _is_paper(prof, strat):
+                print(f"[algo] COPY_MASTER_EMAIL={email} is a PAPER client — mirroring off until it is set Live")
+            else:
+                pid = prof.id
+    _mirror_cache.update(ts=now, pid=pid)
+    return pid
+
+
+def _mirror_leads(db: Session, today: date) -> tuple[Optional[str], dict]:
+    """(master profile id, {security_id: master's AlgoStock today})"""
+    pid = _mirror_pid(db)
+    if not pid:
+        return None, {}
+    rows = (db.query(AlgoStock).join(AlgoRun, AlgoRun.id == AlgoStock.run_id)
+            .filter(AlgoStock.client_profile_id == pid, AlgoRun.run_date == today).all())
+    return pid, {str(r.security_id): r for r in rows}
+
+
+def _mirror_follow(stock: AlgoStock, lead: AlgoStock, strat, ltp: float, trail_steps: list,
+                   book: "_Book", res: "TickResult"):
+    sid = str(stock.security_id)
+    now = datetime.now(timezone.utc)
+    lead_in = bool(lead.entry_price and lead.entry_direction)
+
+    # ── waiting: do exactly what the master does ──────────────────────────────
+    if stock.status == "watching":
+        if lead.status == "cancelled" or (lead.status == "exited" and not lead_in):
+            stock.status      = "cancelled"
+            stock.exit_reason = "MIRROR_SKIP"
+            book.log(stock.run_id, f"SKIP {stock.symbol}: master copy account did not trade it "
+                                   f"({lead.exit_reason or lead.status}) — mirrored")
+            return
+        if not (lead_in and lead.live_status in ("ENTRY_OK", "EXIT_OK", "EXIT_FAILED")):
+            res.open_count += 1                       # master not filled at Dhan yet
+            return
+        fill = float(lead.live_entry_price or lead.entry_price)
+        stock.entry_direction = lead.entry_direction
+        stock.status          = "entered"
+        stock.entry_price     = fill
+        stock.peak_price      = fill
+        stock.entry_time      = lead.entry_time or now
+        book.traded[stock.run_id] = book.traded.get(stock.run_id, 0) + 1
+        sl_price  = _trail_levels(stock, fill, strat, trail_steps)["sl_price"]
+        tgt_price = _target_price(stock, strat)
+        qty       = int(stock.quantity or 1)
+        book.intents.append(OrderIntent(
+            mode=PAPER, kind="ENTRY", stock_id=stock.id, run_id=stock.run_id,
+            profile_id=stock.client_profile_id, symbol=stock.symbol,
+            security_id=sid, side=stock.entry_direction, qty=qty, signal_price=fill))
+        book.log(stock.run_id,
+                 f"PAPER {stock.entry_direction} {stock.symbol} @ ₹{fill:.2f} | mirrored from master live fill "
+                 f"| SL=₹{sl_price:.2f} | target=₹{tgt_price:.2f} | qty={qty}")
+        res.open_count += 1
+        return
+
+    # ── entered: exit only when the master exits ──────────────────────────────
+    if not (stock.entry_price and stock.entry_direction):
+        res.open_count += 1
+        return
+    new_peak = _favourable_peak(stock, ltp)
+    if stock.peak_price is None or float(stock.peak_price) != new_peak:
+        stock.peak_price = new_peak
+
+    if lead.status == "exited" and lead_in:
+        fill = None
+        if lead.live_status == "EXIT_OK" and lead.live_exit_price:
+            fill = float(lead.live_exit_price)
+        else:
+            waited = 0.0
+            try:
+                if lead.exit_time:
+                    et = lead.exit_time if lead.exit_time.tzinfo else lead.exit_time.replace(tzinfo=timezone.utc)
+                    waited = (now - et).total_seconds()
+            except Exception:
+                waited = MIRROR_EXIT_WAIT_SECS
+            if lead.live_status != "ENTRY_OK" or waited >= MIRROR_EXIT_WAIT_SECS:
+                fill = float(lead.exit_price or ltp)  # no broker fill to copy — use master's exit price
+        if fill is None:
+            res.open_count += 1                       # master's exit order still at Dhan
+            return
+        book.exit(stock, strat, lead.exit_reason or "MIRROR", fill, ltp,
+                  note=" | mirrored from master live fill")
+        return
+    if lead.status == "cancelled":                    # master's trade was voided after the fill
+        book.exit(stock, strat, "MIRROR", ltp, ltp, note=" | master trade cancelled — closed at LTP")
+        return
+
+    res.open_count += 1
+    if _live_log_due(f"e-{stock.id}-{stock.run_id}", LIVE_LOG_ENTERED_SECS):
+        st = position_state(stock, ltp, strat, trail_steps)
+        if st:
+            book.log(stock.run_id,
+                     f"OPEN {stock.entry_direction} {stock.symbol} LTP=₹{ltp:.2f} "
+                     f"| entry=₹{float(stock.entry_price):.2f} | P&L=₹{st['pnl']:+.2f} "
+                     f"({st['pnl_r']:+.2f}R) | following master copy account")
+
+
 @dataclass
 class TickResult:
     intents: list = field(default_factory=list)
@@ -1216,6 +1341,7 @@ def _process_tick(ltp_map: dict) -> TickResult:
         stocks.sort(key=lambda x: 0 if x.status == "entered" else 1)
         ctx  = _load_ctx(db, {s.client_profile_id for s in stocks})
         book = _Book(db, today)
+        master_pid, leads = _mirror_leads(db, today)
 
         for stock in stocks:
             sid = str(stock.security_id)
@@ -1227,6 +1353,13 @@ def _process_tick(ltp_map: dict) -> TickResult:
                 continue
 
             trail_steps = strat.trail
+
+            # PAPER client + master copy account has this stock → follow the master's real trade
+            lead = leads.get(sid) if leads else None
+            if (lead is not None and strat.paper and stock.client_profile_id != master_pid
+                    and stock.live_status is None):
+                _mirror_follow(stock, lead, strat, ltp, trail_steps, book, res)
+                continue
 
             # ── WATCHING: wait for the trigger ────────────────────────────────
             if stock.status == "watching":
