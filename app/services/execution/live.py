@@ -327,6 +327,72 @@ def _live_note(it: OrderIntent, msg: str):
     engine._log_runs_sync([it.run_id], msg)
 
 
+def _rebook_at_fills(db, stock: AlgoStock):
+    """A live trade is booked by the algo at the signal LTP. Once Dhan's real fills are known,
+    restate entry / exit / P&L at those fills and move the run + daily totals by the difference,
+    so the WOI Algo pages show exactly what the Dhan account made. (caller commits)"""
+    if not (stock.entry_direction and stock.live_exit_price):
+        return
+    entry = float(stock.live_entry_price or stock.entry_price or 0)
+    exitp = float(stock.live_exit_price)
+    q     = int(stock.quantity or 0)
+    if entry <= 0 or q <= 0:
+        return
+    new   = round((exitp - entry) * q if stock.entry_direction == "BUY" else (entry - exitp) * q, 2)
+    old   = float(stock.pnl or 0)
+    delta = round(new - old, 2)
+    stock.entry_price = entry
+    stock.exit_price  = exitp
+    stock.pnl         = new
+    if abs(delta) < 0.01:
+        return
+    db.execute(update(AlgoRun).where(AlgoRun.id == stock.run_id).values(
+        total_pnl=func.coalesce(AlgoRun.total_pnl, 0) + delta))
+    db.execute(update(DailyPnl).where(DailyPnl.client_profile_id == stock.client_profile_id,
+                                      DailyPnl.date == date.today()).values(
+        closed_pnl=func.coalesce(DailyPnl.closed_pnl, 0) + delta,
+        total_pnl=func.coalesce(DailyPnl.total_pnl, 0) + delta))
+    engine._append_run_log(db, stock.run_id, [
+        f"[{engine._stamp()}] LIVE {stock.symbol}: booked at Dhan fills — entry ₹{entry:.2f} → exit ₹{exitp:.2f} "
+        f"| P&L ₹{new:+.2f} (algo signal prices gave ₹{old:+.2f})"])
+
+
+def _store_entry_fill_sync(stock_id: str, avg: float):
+    db = SessionLocal()
+    try:
+        s = db.query(AlgoStock).filter(AlgoStock.id == stock_id).first()
+        if not s or s.live_entry_price:
+            return
+        s.live_entry_price = avg
+        engine._append_run_log(db, s.run_id, [f"[{engine._stamp()}] LIVE {s.symbol}: entry fill confirmed ₹{avg:.2f}"])
+        if s.status == "exited" and s.live_exit_price:
+            _rebook_at_fills(db, s)
+        db.commit()
+    except Exception as e:
+        print(f"[live] store entry fill failed: {type(e).__name__}: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _entry_fill_known_sync(stock_id: str) -> bool:
+    db = SessionLocal()
+    try:
+        s = db.query(AlgoStock.live_entry_price).filter(AlgoStock.id == stock_id).first()
+        return bool(s and s[0])
+    finally:
+        db.close()
+
+
+async def _ensure_entry_fill(it: OrderIntent, token: str, proxy: dict, entry_oid: str):
+    """The entry poll can end while Dhan still says PENDING (no avg price) — fetch the fill now."""
+    if not entry_oid or await asyncio.to_thread(_entry_fill_known_sync, it.stock_id):
+        return
+    f = await _poll_fill(token, proxy, entry_oid, rounds=6)
+    if f.get("avg"):
+        await asyncio.to_thread(_store_entry_fill_sync, it.stock_id, float(f["avg"]))
+
+
 def _live_record_success(it: OrderIntent, order_id: str, fill: dict, qty: int, how: str = "MKT"):
     """Persist order id / status / fill; log one clear line. (worker thread)"""
     db = SessionLocal()
@@ -355,6 +421,8 @@ def _live_record_success(it: OrderIntent, order_id: str, fill: dict, qty: int, h
             stock.live_status = "EXIT_OK"
             if avg > 0:
                 stock.live_exit_price = avg
+                if stock.status == "exited":
+                    _rebook_at_fills(db, stock)       # algo booked it at the signal LTP — restate at Dhan fills
         engine._append_run_log(db, it.run_id, [
             f"[{engine._stamp()}] LIVE {it.kind} {it.side} {it.symbol} x{qty} @ {how} ✓ order_id={order_id} "
             f"status={st}{(' filled ' + str(fill.get('filled'))) if fill.get('filled') else ''}{slip}"
@@ -640,6 +708,7 @@ async def _place_protective(it: OrderIntent):
                                 f"the engine will exit at market on SL / target")
         return
     proxy = ctx.get("proxy") or {}
+    entry_oid = ctx.get("buy_oid") if it.side == "BUY" else ctx.get("sell_oid")
     # The entry fill is already confirmed. Dhan's positions can lag the fill by a moment, so a
     # 0 right after the fill is not "flat" — re-check a few times, then protect the entry qty.
     net = None
@@ -686,6 +755,9 @@ async def _place_protective(it: OrderIntent):
 
     if res.get("success") or placed_tgt:
         _start_oco(it.stock_id, it.run_id, it.profile_id, it.symbol, it.security_id, side, qty)
+
+    # exit legs are safe at Dhan — now make sure the real entry fill price is on record
+    await _ensure_entry_fill(it, token, proxy, entry_oid)
 
 
 async def _target_order(it: OrderIntent, token: str, proxy: dict) -> Optional[str]:
