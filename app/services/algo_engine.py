@@ -153,6 +153,47 @@ def _subscribed_clients(db: Session) -> list[tuple[ClientProfile, AlgoStrategy]]
     return result
 
 
+# Settings that stay per client even though the master config form has them
+CLIENT_OWN_FIELDS = {"risk_per_trade"}
+
+
+def _sync_master_config(db: Session, clients) -> dict:
+    """8:45 — copy every master-config setting into every subscribed client's strategy, so all
+    accounts (paper and live) select and trade the same stocks. A client row that drifted (old
+    defaults, own form save) is corrected here. Risk per trade stays per client.
+    Returns {profile_id: ["min_price 50→0", ...]} for the rows that changed."""
+    from app.models.trading import MasterAlgoConfig
+    from app.routers.algo import MASTER_FIELDS
+    cfg = db.query(MasterAlgoConfig).filter(MasterAlgoConfig.id == 1).first()
+    if not cfg:
+        print("[algo] No master config saved yet — client settings used as they are")
+        return {}
+    changed: dict = {}
+    for profile, strat in clients:
+        diffs = []
+        for f in MASTER_FIELDS:
+            if f in CLIENT_OWN_FIELDS:
+                continue
+            new = getattr(cfg, f, None)
+            if new is None:
+                continue
+            old = getattr(strat, f, None)
+            same = old == new
+            if not same:
+                try:
+                    same = float(old) == float(new)
+                except (TypeError, ValueError):
+                    same = str(old) == str(new)
+            if not same:
+                setattr(strat, f, new)
+                diffs.append(f"{f} {old}→{new}")
+        if diffs:
+            changed[profile.id] = diffs
+    db.commit()
+    print(f"[algo] Master config applied to {len(clients)} clients — {len(changed)} had drifted and were corrected")
+    return changed
+
+
 def _get_or_create_run(profile_id: str, strategy_id: str, db: Session) -> AlgoRun:
     today = date.today()
     run   = db.query(AlgoRun).filter(
@@ -2304,6 +2345,12 @@ async def run_daily_algo():
             return
 
         print(f"[algo] Subscribed clients: {len(clients)}")
+        try:
+            synced = _sync_master_config(db, clients)
+        except Exception as e:
+            db.rollback()
+            synced = {}
+            print(f"[algo] Master config sync failed ({type(e).__name__}: {e}) — client settings used as they are")
 
         print("[algo] Getting master data account token...")
         jwt, api_key, master_client_id = await _fresh_master_token()
@@ -2327,6 +2374,8 @@ async def run_daily_algo():
             runs[profile.id] = (run, strategy)
             _log(run, f"═══ WOI Algo run started — {now_ist.strftime('%Y-%m-%d')} ═══", db)
             _log_mode(run, profile, strategy, db)
+            if synced.get(profile.id):
+                _log(run, "Master config applied — corrected: " + ", ".join(synced[profile.id]), db)
             _log(run,
                 f"Strategy: {strategy.name} | Gap: {strategy.gap_min}–{strategy.gap_max}% | "
                 f"Risk: ₹{strategy.risk_per_trade} | Target: 1:{strategy.target_r}R | "
