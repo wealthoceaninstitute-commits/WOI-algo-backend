@@ -1,93 +1,94 @@
-from pydantic import BaseModel, EmailStr, field_validator
-from typing import Optional
-from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from datetime import datetime, timezone, timedelta
+import secrets
+
+from app.core.database import get_db
+from app.core.security import (
+    hash_password, verify_password, create_access_token,
+    get_current_user, require_master,
+)
+from app.models.user import User
+from app.models.trading import ClientProfile, Fund
+from app.schemas.auth import (
+    ClientRegisterRequest, LoginRequest, TokenResponse, UserResponse,
+    ForgotPasswordRequest, ForgotPasswordResponse,
+    ResetPasswordRequest, ChangePasswordRequest,
+    MasterResetClientPasswordRequest,
+)
+
+router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+# In-memory token store: {token: (user_id, expires_at)}
+# For production swap with a DB table or Redis.
+_reset_tokens: dict[str, tuple[str, datetime]] = {}
+
+RESET_TOKEN_TTL_MINUTES = 60
 
 
-# ── Registration ──────────────────────────────────────────────────────────────
+def _create_client_profile(db: Session, user: User, data: ClientRegisterRequest):
+    """Create ClientProfile + Fund after user creation."""
+    profile = ClientProfile(
+        user_id=user.id,
+        city=data.city,
+        state=data.state,
+        capital=data.capital,
+        paper_trading=True,
+        active_index="SENSEX",
+    )
+    db.add(profile)
+    db.flush()  # get profile.id
 
-class ClientRegisterRequest(BaseModel):
-    name: str
-    email: EmailStr
-    phone: Optional[str] = None
-    password: str
-    city: Optional[str] = None
-    state: Optional[str] = None
-    capital: float = 0.0
-
-    @field_validator("password")
-    @classmethod
-    def password_min_length(cls, v: str) -> str:
-        if len(v) < 6:
-            raise ValueError("Password must be at least 6 characters")
-        return v
-
-    @field_validator("name")
-    @classmethod
-    def name_not_empty(cls, v: str) -> str:
-        if len(v.strip()) < 2:
-            raise ValueError("Name must be at least 2 characters")
-        return v.strip()
+    fund = Fund(
+        client_profile_id=profile.id,
+        available=data.capital,
+        used_margin=0,
+        total_balance=data.capital,
+    )
+    db.add(fund)
 
 
-class MasterCreateClientRequest(ClientRegisterRequest):
-    """Master creating a client — password is optional (defaults to client@123)"""
-    password: str = "client@123"
+@router.post("/register", response_model=TokenResponse, status_code=201)
+def register(payload: ClientRegisterRequest, db: Session = Depends(get_db)):
+    """Self-registration for clients."""
+    existing = db.query(User).filter(User.email == payload.email.lower()).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    user = User(
+        name=payload.name.strip(),
+        email=payload.email.lower(),
+        phone=payload.phone,
+        password_hash=hash_password(payload.password),
+        role="CLIENT",
+    )
+    db.add(user)
+    db.flush()
+    _create_client_profile(db, user, payload)
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token({"sub": user.id, "role": user.role})
+    return TokenResponse(
+        access_token=token,
+        role=user.role,
+        user_id=user.id,
+        name=user.name,
+    )
 
 
-# ── Login ─────────────────────────────────────────────────────────────────────
+@router.post("/login", response_model=TokenResponse)
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == payload.email.lower()).first()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
 
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
+    token = create_access_token({"sub": user.id, "role": user.role})
+    return TokenResponse(
+        access_token=token,
+        role=user.role,
+        user_id=user.id,
+        name=user.name,
+    )
 
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    role: str
-    user_id: str
-    name: str
-
-
-# ── Profile ───────────────────────────────────────────────────────────────────
-
-class UpdateProfileRequest(BaseModel):
-    name: Optional[str] = None
-    phone: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
-    pan: Optional[str] = None
-    active_index: Optional[str] = None
-    paper_trading: Optional[bool] = None
-    capital: Optional[float] = None
-
-
-class UserResponse(BaseModel):
-    id: str
-    name: str
-    email: str
-    phone: Optional[str]
-    role: str
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-class ClientProfileResponse(BaseModel):
-    profile_id: str
-    user_id: str
-    name: str
-    email: str
-    phone: Optional[str]
-    city: Optional[str]
-    state: Optional[str]
-    pan: Optional[str]
-    active_index: str
-    paper_trading: bool
-    capital: float
-    has_api_credentials: bool
-    has_proxy: bool
-    api_connected: bool
-    today_pnl: float
-    created_at: datetime
