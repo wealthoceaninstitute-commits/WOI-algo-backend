@@ -1,93 +1,97 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
-from datetime import datetime, timezone
-
-from app.core.database import get_db
-from app.core.security import hash_password, verify_password, create_access_token, get_current_user
-from app.models.user import User
-from app.models.trading import ClientProfile, Fund
-from app.schemas.auth import ClientRegisterRequest, LoginRequest, TokenResponse, UserResponse
-
-router = APIRouter(prefix="/api/auth", tags=["auth"])
+from pydantic import BaseModel, EmailStr, field_validator
+from typing import Optional
+from datetime import datetime
 
 
-def _create_client_profile(db: Session, user: User, data: ClientRegisterRequest):
-    """Create ClientProfile + Fund after user creation."""
-    profile = ClientProfile(
-        user_id=user.id,
-        city=data.city,
-        state=data.state,
-        capital=data.capital,
-        paper_trading=True,
-        active_index="SENSEX",
-    )
-    db.add(profile)
-    db.flush()  # get profile.id
+# ── Registration ──────────────────────────────────────────────────────────────
 
-    fund = Fund(
-        client_profile_id=profile.id,
-        available=data.capital,
-        used_margin=0,
-        total_balance=data.capital,
-    )
-    db.add(fund)
+class ClientRegisterRequest(BaseModel):
+    name: str
+    email: EmailStr
+    phone: Optional[str] = None
+    password: str
+    city: Optional[str] = None
+    state: Optional[str] = None
+    capital: float = 0.0
 
+    @field_validator("password")
+    @classmethod
+    def password_min_length(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("Password must be at least 6 characters")
+        return v
 
-@router.post("/register", response_model=TokenResponse, status_code=201)
-def register(payload: ClientRegisterRequest, db: Session = Depends(get_db)):
-    """Self-registration for clients."""
-    existing = db.query(User).filter(User.email == payload.email.lower()).first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Email already registered")
-
-    user = User(
-        name=payload.name.strip(),
-        email=payload.email.lower(),
-        phone=payload.phone,
-        password_hash=hash_password(payload.password),
-        role="CLIENT",
-    )
-    db.add(user)
-    db.flush()
-    _create_client_profile(db, user, payload)
-    db.commit()
-    db.refresh(user)
-
-    token = create_access_token({"sub": user.id, "role": user.role})
-    return TokenResponse(
-        access_token=token,
-        role=user.role,
-        user_id=user.id,
-        name=user.name,
-    )
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        if len(v.strip()) < 2:
+            raise ValueError("Name must be at least 2 characters")
+        return v.strip()
 
 
-@router.post("/login", response_model=TokenResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email.lower()).first()
-    if not user or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-
-    token = create_access_token({"sub": user.id, "role": user.role})
-    return TokenResponse(
-        access_token=token,
-        role=user.role,
-        user_id=user.id,
-        name=user.name,
-    )
+class MasterCreateClientRequest(ClientRegisterRequest):
+    """Master creating a client — password is optional (defaults to client@123)"""
+    password: str = "client@123"
 
 
-# OAuth2 form-compatible login (for Swagger UI "Authorize" button)
-@router.post("/token", response_model=TokenResponse, include_in_schema=False)
-def token_login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == form.username.lower()).first()
-    if not user or not verify_password(form.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_access_token({"sub": user.id, "role": user.role})
-    return TokenResponse(access_token=token, role=user.role, user_id=user.id, name=user.name)
+# ── Login ─────────────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
 
 
-@router.get("/me", response_model=UserResponse)
-def me(current_user: User = Depends(get_current_user)):
-    return current_user
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    role: str
+    user_id: str
+    name: str
+
+
+# ── Password Reset ─────────────────────────────────────────────────────────────
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ForgotPasswordResponse(BaseModel):
+    message: str
+    reset_token: Optional[str] = None  # returned so Master can share with client
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def password_min_length(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("Password must be at least 6 characters")
+        return v
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def password_min_length(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("Password must be at least 6 characters")
+        return v
+
+
+class MasterResetClientPasswordRequest(BaseModel):
+    """Master directly resets a client's password by user_id."""
+    new_password: str = "client@123"
+
+    @field_validator("new_password")
+    @classmethod
+    def password_min_length(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("Password must be at least 6 characters")
+        return v
+
